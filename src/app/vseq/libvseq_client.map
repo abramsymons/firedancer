@@ -1,0 +1,6 @@
+VER_1 {
+    global:
+        vseq_client_*;
+    local:
+        *;
+};
