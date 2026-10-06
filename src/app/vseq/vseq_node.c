@@ -107,11 +107,8 @@ struct __attribute__((aligned(FD_SHA512_ALIGN))) vseq_node {
   union {
     ag_vote_t          vote;
     ag_cert_t          cert;
-    ag_event_pool_t    pool_event;
-    ag_event_vote_t    vote_event;
-    ag_event_cert_t    cert_event;
-    ag_event_repair_t  repair_event;
-    ag_event_timeout_t timeout_event;
+    ag_pool_event_t    pool_event;
+    ag_block_id_t      block_id;
   } scratch;
 
   vseq_node_metrics_t     metrics;
@@ -276,9 +273,9 @@ replay( vseq_node_t * node,
   ag_pool_add_block( node->pool, &blk->id, &blk->parent, node->bad );
   ban_bad_ranks( node, blk->id.slot, node->bad );
 
-  ag_event_replay_t event = { .slot = blk->id.slot, .block_info = { .parent = blk->parent } };
-  memcpy( event.block_info.hash, blk->id.hash, sizeof(ag_block_hash_t) );
-  ag_votor_handle_replay_event( node->votor, &event );
+  ag_block_info_t info = { .parent = blk->parent };
+  memcpy( info.hash, blk->id.hash, sizeof(ag_block_hash_t) );
+  ag_votor_process_replay( node->votor, blk->id.slot, &info );
 }
 
 /* try_complete marks blk complete once its parent is, then does the
@@ -526,14 +523,15 @@ deliver_finalized( vseq_node_t * node ) {
 
 static void
 handle_pool_event( vseq_node_t *           node,
-                   ag_event_pool_t const * event ) {
+                   ag_pool_event_t const * event ) {
+  if( event->kind==AG_POOL_EVENT_IMPLICITLY_SKIPPED || event->kind==AG_POOL_EVENT_IMPLICITLY_FINALIZED ) return; /* not for votor */
   ag_votor_handle_pool_event( node->votor, event, node->now );
   switch( event->kind ) {
-  case AG_EVENT_POOL_PARENT_READY:
+  case AG_POOL_EVENT_PARENT_READY:
     node->highest_parent_ready_slot = fd_ulong_max( node->highest_parent_ready_slot, event->parent_ready.slot );
     maybe_lead( node, event->parent_ready.slot, &event->parent_ready.parent );
     break;
-  case AG_EVENT_POOL_CERT_CREATED:
+  case AG_POOL_EVENT_CERT_CREATED:
     switch( event->cert_created.kind ) {
     case AG_CERT_KIND_FAST_FINAL: node->metrics.fast_final_certs++; break;
     case AG_CERT_KIND_FINAL:      node->metrics.final_certs++;      break;
@@ -552,42 +550,42 @@ handle_pool_event( vseq_node_t *           node,
    is withheld.  Votes are persisted before they leave. */
 
 static void
-handle_own_vote( vseq_node_t *           node,
-                 ag_event_vote_t const * event ) {
+handle_own_vote( vseq_node_t *     node,
+                 ag_vote_t const * vote ) {
   uchar quorum_reached;
-  int   err = ag_pool_add_vote( node->pool, &event->vote, node->bad, &quorum_reached );
-  ban_bad_ranks( node, ag_vote_slot( &event->vote ), node->bad );
+  int   err = ag_pool_add_vote( node->pool, vote, node->bad, &quorum_reached );
+  ban_bad_ranks( node, ag_vote_slot( vote ), node->bad );
   if( FD_UNLIKELY( err && err!=AG_POOL_ERR_DUPLICATE ) ) {
     char cstr[ AG_VOTE_CSTR_MAX ];
-    FD_LOG_INFO(( "withholding %s: %s", ag_vote_to_cstr( &event->vote, cstr ), ag_pool_strerror( err ) ));
+    FD_LOG_INFO(( "withholding %s: %s", ag_vote_to_cstr( vote, cstr ), ag_pool_strerror( err ) ));
     node->metrics.votes_withheld++;
     return;
   }
 
   node->msg[0] = VSEQ_MSG_VOTE;
-  ulong sz = 1UL + ag_vote_ser( &event->vote, node->msg+1UL );
+  ulong sz = 1UL + ag_vote_ser( vote, node->msg+1UL );
   if( FD_LIKELY( !err && node->cfg.persist_vote ) ) {
     blk_t const * blk = NULL;
-    if( event->vote.kind==AG_VOTE_KIND_NOTAR ) {
-      ag_block_id_t id = ag_block_id( event->vote.notar.slot, event->vote.notar.block_hash );
+    if( vote->kind==AG_VOTE_KIND_NOTAR ) {
+      ag_block_id_t id = ag_block_id( vote->notar.slot, vote->notar.block_hash );
       blk = blk_query( node, &id );
       FD_TEST( blk ); /* votor only votes notar for blocks we replayed */
     }
-    node->cfg.persist_vote( node->cfg.cb_ctx, ag_vote_slot( &event->vote ), node->msg+1UL, sz-1UL,
+    node->cfg.persist_vote( node->cfg.cb_ctx, ag_vote_slot( vote ), node->msg+1UL, sz-1UL,
                             blk ? blk->wire+1UL : NULL, blk ? blk->wire_sz-1UL : 0UL );
   }
   send_msg( node, VSEQ_DST_ALL, node->msg, sz );
 }
 
 static void
-handle_own_cert( vseq_node_t *           node,
-                 ag_event_cert_t const * event ) {
-  if( FD_UNLIKELY( ag_cert_slot( &event->cert )<=node->root.slot ) ) return; /* root certs, incl. the genesis seed, see vseq_node_create */
-  ag_pool_add_cert( node->pool, &event->cert, node->bad );
-  ban_bad_ranks( node, ag_cert_slot( &event->cert ), node->bad );
+handle_own_cert( vseq_node_t *     node,
+                 ag_cert_t const * cert ) {
+  if( FD_UNLIKELY( ag_cert_slot( cert )<=node->root.slot ) ) return; /* root certs, rebroadcast by standstill recovery: peers have them */
+  ag_pool_add_cert( node->pool, cert, node->bad );
+  ban_bad_ranks( node, ag_cert_slot( cert ), node->bad );
 
   node->msg[0] = VSEQ_MSG_CERT;
-  ulong sz = 1UL + ag_cert_ser( &event->cert, node->msg+1UL );
+  ulong sz = 1UL + ag_cert_ser( cert, node->msg+1UL );
   send_msg( node, VSEQ_DST_ALL, node->msg, sz );
 }
 
@@ -663,24 +661,13 @@ vseq_node_create( vseq_node_cfg_t const * cfg,
   node->next_set = vseq_sched_next( node->sched, root_set );
   advance_pool( node, root_set );
   if( node->next_set ) advance_pool( node, node->next_set );
-  ag_pool_init( node->pool, node->root.slot );
+  ag_pool_init( node->pool, &node->root );
 
-  /* ag_pool_init does not mark the root block as certified in the pool's
-     ParentReady tracker (the Rust reference's ParentReadyTracker::new
-     and test_ag_parent_ready_tracker.c both seed it).  Without that, a
-     skipped window right after the root never yields ParentReady and
-     the network stalls for good.  Seed it through the public API with
-     the root's certs: the real ones from the ledger, or for genesis a
-     locally trusted FastFinal cert with no signatures.  Root certs are
-     never sent (handle_own_cert).  A cert, rather than just a tracker
-     entry, also gives standstill recovery the root's finalization cert
-     it requires. */
+  /* A root from the ledger must be finalized by its certs.  They go
+     into the pool too, so standstill recovery can rebroadcast them. */
 
   ag_cert_t * cert = &node->scratch.cert;
-  if( !node->root.slot ) {
-    *cert = (ag_cert_t){ .kind = AG_CERT_KIND_FAST_FINAL, .fast_final = { .slot = 0UL, .shred_version = cfg->network_id } };
-    FD_TEST( !ag_pool_add_verified_cert( node->pool, cert, node->bad ) );
-  } else {
+  if( node->root.slot ) {
     int err = vseq_proof_verify( root_set->epoch, cfg->network_id, node->root.slot, node->root.hash, cfg->root_proof, cfg->root_proof_sz, cert );
     if( FD_UNLIKELY( err ) ) {
       FD_LOG_WARNING(( "certs of root slot %lu do not verify (%d)", node->root.slot, err ));
@@ -694,7 +681,7 @@ vseq_node_create( vseq_node_cfg_t const * cfg,
       off += sizeof(uint)+sz;
     }
   }
-  ag_votor_init( node->votor, node->root.slot, now, cfg->ns_per_slot, cfg->network_id, sign_bls, node );
+  ag_votor_init( node->votor, &node->root, now, cfg->ns_per_slot, cfg->network_id, sign_bls, node );
   advance_votor( node, root_set );
   if( node->next_set ) advance_votor( node, node->next_set );
 
@@ -857,24 +844,26 @@ vseq_node_service( vseq_node_t * node,
   for(;;) {
     int busy = leader_tick( node );
 
-    while( ag_votor_poll_timeout_event( node->votor, now, &node->scratch.timeout_event ) ) {
-      ag_votor_handle_timeout_event( node->votor, &node->scratch.timeout_event );
+    ulong timeout_slot;
+    while( ag_votor_poll_skip_timeout( node->votor, now, &timeout_slot ) ) {
+      ag_votor_handle_skip_timeout( node->votor, timeout_slot );
       busy = 1;
     }
     while( ag_pool_poll_pool_event( node->pool, &node->scratch.pool_event ) ) {
       handle_pool_event( node, &node->scratch.pool_event );
       busy = 1;
     }
-    while( ag_votor_poll_vote_event( node->votor, &node->scratch.vote_event ) ) {
-      handle_own_vote( node, &node->scratch.vote_event );
+    uchar reason;
+    while( ag_votor_poll_vote( node->votor, &node->scratch.vote, &reason ) ) {
+      handle_own_vote( node, &node->scratch.vote );
       busy = 1;
     }
-    while( ag_votor_poll_cert_event( node->votor, &node->scratch.cert_event ) ) {
-      handle_own_cert( node, &node->scratch.cert_event );
+    while( ag_votor_poll_cert( node->votor, &node->scratch.cert ) ) {
+      handle_own_cert( node, &node->scratch.cert );
       busy = 1;
     }
-    while( ag_pool_poll_repair_event( node->pool, &node->scratch.repair_event ) ) {
-      repair_request( node, &node->scratch.repair_event.block );
+    while( ag_pool_poll_repair_event( node->pool, &node->scratch.block_id ) ) {
+      repair_request( node, &node->scratch.block_id );
       busy = 1;
     }
     if( !busy ) break;
@@ -895,7 +884,7 @@ vseq_node_service( vseq_node_t * node,
     advance_votor( node, node->next_set );
   }
 
-  long next = ag_votor_next_timeout( node->votor );
+  long next = ag_votor_next_skip_timeout( node->votor );
   next = fd_long_min( next, repair_tick( node ) );
   next = fd_long_min( next, node->last_final_ts+AG_DELTA_STANDSTILL_NS );
   if( node->lead_window!=ULONG_MAX ) next = fd_long_min( next, node->lead_t0+(long)(node->lead_idx+1UL)*node->cfg.ns_per_slot );
