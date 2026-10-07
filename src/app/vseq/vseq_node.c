@@ -14,6 +14,18 @@
 #define VOTE_LOOKAHEAD_MAX (40UL)                    /* slots past the highest ParentReady */
 #define BAN_NS             (10L*1000L*1000L*1000L)   /* drop a peer's messages for 10 s */
 #define REPAIR_MAX         (128UL)
+
+/* A leader can sign any number of blocks for its slots, so the store
+   keeps at most BLKS_PER_SLOT_MAX per slot: an honest leader makes one,
+   and the fallback path settles on at most AG_NOTAR_FALLBACK_VOTE_MAX
+   candidates.  One the pool asked to repair (votes or certs name it) is
+   taken up to BLKS_PER_SLOT_WANTED, below the pool's own per-slot limit
+   on block hashes.  Only the slot's leader can sign blocks for it, so
+   the cap never keeps out another validator's block. */
+
+#define BLKS_PER_SLOT_MAX    (4UL)
+#define BLKS_PER_SLOT_WANTED (AG_EQVOC_BLOCK_HASH_MAX-1UL)
+FD_STATIC_ASSERT( BLKS_PER_SLOT_MAX<BLKS_PER_SLOT_WANTED, per_slot_cap );
 #define REPAIR_RETRY_NS    (100L*1000L*1000L)        /* ask the next peer after 100 ms */
 #define REPAIR_BODY_SZ     (sizeof(ulong)+sizeof(ag_block_hash_t))
 #define BODY_MAX           (AG_VOTE_SER_MAX>AG_CERT_SER_MAX ? AG_VOTE_SER_MAX : AG_CERT_SER_MAX)
@@ -203,14 +215,33 @@ blk_query( vseq_node_t *         node,
   return blk_map_ele_query( node->blk_map, id, NULL, node->blks );
 }
 
+static ulong
+blk_slot_cnt( vseq_node_t * node,
+              ulong         slot ) {
+  ulong cnt = 0UL;
+  for( blk_map_iter_t iter = blk_map_iter_init( node->blk_map, node->blks );
+                            !blk_map_iter_done( iter, node->blk_map, node->blks );
+                      iter = blk_map_iter_next( iter, node->blk_map, node->blks ) ) {
+    cnt += blk_map_iter_ele( iter, node->blk_map, node->blks )->id.slot==slot;
+  }
+  return cnt;
+}
+
 /* Repair *************************************************************/
+
+static int
+repair_wanted( vseq_node_t const *   node,
+               ag_block_id_t const * id ) {
+  for( ulong i=0UL; i<node->repair_cnt; i++ ) if( ag_block_id_eq( &node->repairs[i].id, id ) ) return 1;
+  return 0;
+}
 
 static void
 repair_request( vseq_node_t *         node,
                 ag_block_id_t const * id ) {
   if( FD_UNLIKELY( id->slot<=node->delivered.slot ) ) return;
   if( FD_LIKELY( blk_query( node, id ) ) ) return;
-  for( ulong i=0UL; i<node->repair_cnt; i++ ) if( ag_block_id_eq( &node->repairs[i].id, id ) ) return;
+  if( FD_UNLIKELY( repair_wanted( node, id ) ) ) return;
   if( FD_UNLIKELY( node->repair_cnt==REPAIR_MAX ) ) return; /* retried once others resolve */
   node->repairs[ node->repair_cnt++ ] = (repair_t){ .id = *id, .next_ts = node->now, .attempt = 0UL };
 }
@@ -355,6 +386,11 @@ on_block( vseq_node_t * node,
 
   ag_block_id_t id = ag_block_id( block.slot, hash );
   if( FD_UNLIKELY( blk_query( node, &id ) ) ) return;
+  ulong slot_cnt = blk_slot_cnt( node, block.slot );
+  if( FD_UNLIKELY( slot_cnt>=BLKS_PER_SLOT_MAX && !( slot_cnt<BLKS_PER_SLOT_WANTED && repair_wanted( node, &id ) ) ) ) {
+    node->metrics.blocks_refused++;
+    return;
+  }
   if( FD_UNLIKELY( !blk_pool_free( node->blks ) ) ) {
     FD_LOG_WARNING(( "block store full, dropping block for slot %lu", block.slot ));
     return;
@@ -655,7 +691,7 @@ vseq_node_create( vseq_node_cfg_t const * cfg,
 
   node->pool_mem  = alloc_aligned( ag_pool_align(),  ag_pool_footprint ( cfg->slot_max ) );
   node->votor_mem = alloc_aligned( ag_votor_align(), ag_votor_footprint( cfg->slot_max ) );
-  node->blk_max   = 2UL*cfg->slot_max + cfg->retain_slots;
+  node->blk_max   = cfg->slot_max*BLKS_PER_SLOT_WANTED + cfg->retain_slots;
   ulong chain_cnt = blk_map_chain_cnt_est( node->blk_max );
   node->blk_pool_mem = alloc_aligned( blk_pool_align(), blk_pool_footprint( node->blk_max ) );
   node->blk_map_mem  = alloc_aligned( blk_map_align(),  blk_map_footprint ( chain_cnt     ) );

@@ -160,6 +160,7 @@ validator that skipped a required upgrade on any chain.
 | Messages lost | votor rebroadcasts on standstill (10 s); missing blocks are repaired by hash |
 | Leader offline | its window times out, validators vote skip, the next leader builds on the last certified block |
 | Equivocating leader | votor's notar-fallback path; blocks repaired by hash; tested in the simulator |
+| Leader floods signed junk blocks for its slots | at most 4 stored per slot (6 if the pool asks for one by hash), the rest refused; only the slot's leader can sign for it, so no other validator's block is affected (`flood` scenario) |
 | Node crash and restart | reopen the ledger (torn tail cut), reload the vote history, catch up from peers if behind |
 | Whole cluster restarts at once | each node resumes from its own ledger and history; finalization resumes, no conflicting votes |
 | Node far behind (more than `--slot-max`) | stops consensus, fetches finalized blocks from peers (`SYNC_REQ`), checks their certs, then rejoins |

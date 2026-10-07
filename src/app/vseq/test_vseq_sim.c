@@ -28,7 +28,11 @@
    An equivocating leader sends a second, differently signed version of
    each of its blocks (one extra tx) to the ranks in equiv_dst_mask,
    including in repair responses.  This drives votor's notar-fallback
-   and safe-to-notar paths and repair by block hash.
+   and safe-to-notar paths and repair by block hash.  With flood, it
+   also sends everyone that many signed junk blocks for each slot it
+   leads in the next slot_max, every time it builds a block: a leader
+   can sign anything for its own slots, and the nodes' block store must
+   not fill up with it.
 
    A scenario can change the validator set at epoch change_epoch: nodes
    in leave_mask leave it and nodes in join_mask join (both by node
@@ -73,6 +77,7 @@ struct scenario {
   ulong        down_mask;          /* by rank */
   ulong        equiv_mask;         /* ranks that equivocate as leader */
   ulong        equiv_dst_mask;     /* ranks that get the other version */
+  ulong        flood;              /* junk blocks per future slot from equivocating leaders */
   long         lat_min;
   long         lat_max;
   float        drop;
@@ -291,6 +296,28 @@ sim_persist_block( void * ctx,
   sn->block_floor = slot;
 }
 
+static void sim_deliver( sim_t * sim, sim_node_t const * from, ulong dst, uchar const * buf, ulong sz );
+
+/* flood sends every other node sc->flood distinct signed blocks for
+   each slot from leads in the slot_max slots after block. */
+
+static void
+flood( sim_t *            sim,
+       sim_node_t const * from,
+       vseq_block_t const * block ) {
+  uchar msg[ 1UL+VSEQ_BLOCK_HDR_SZ+sizeof(ulong) ];
+  for( ulong s=block->slot+1UL; s<block->slot+from->cfg.slot_max; s++ ) {
+    if( vseq_sched_leader( sim->sched, s )!=from->peer ) continue;
+    for( ulong v=0UL; v<sim->sc->flood; v++ ) {
+      uchar           payload[ 8 ]; FD_STORE( ulong, payload, v );
+      ag_block_hash_t hash;
+      msg[0] = VSEQ_MSG_BLOCK;
+      ulong sz = 1UL + vseq_block_build( msg+1UL, s, &block->parent, payload, sizeof(payload), from->id_pub, from->id_sec, sim->sha, hash );
+      sim_deliver( sim, from, VSEQ_DST_ALL, msg, sz );
+    }
+  }
+}
+
 static void
 sim_send( void *        ctx,
           ulong         dst,
@@ -299,6 +326,21 @@ sim_send( void *        ctx,
   sim_node_t * from = ctx;
   sim_t *      sim  = from->sim;
   track_sent( from, buf, sz );
+  sim_deliver( sim, from, dst, buf, sz );
+
+  if( FD_UNLIKELY( sim->sc->flood && ( sim->equiv_mask & (1UL<<from->peer) ) && buf[0]==VSEQ_MSG_BLOCK && dst==VSEQ_DST_ALL ) ) {
+    vseq_block_t block;
+    FD_TEST( !vseq_block_parse( &block, buf+1UL, sz-1UL ) );
+    flood( sim, from, &block );
+  }
+}
+
+static void
+sim_deliver( sim_t *            sim,
+             sim_node_t const * from,
+             ulong              dst,
+             uchar const *      buf,
+             ulong              sz ) {
 
   uchar const * alt    = NULL;
   ulong         alt_sz = 0UL;
@@ -746,6 +788,8 @@ static scenario_t const scenarios[] = {
   { .name = "genesis-down", .node_cnt = 5, .down_mask = 1UL<<0, /* the genesis window's leader */
                                       .lat_min = 20*MS,  .lat_max = 60*MS,  .duration = 60*SEC, .tx_per_sec = 200, .min_delivered = 100 },
   { .name = "equivocate", .node_cnt = 5, .equiv_mask = 1UL<<4, .equiv_dst_mask = (1UL<<0)|(1UL<<1),
+                                      .lat_min = 20*MS,  .lat_max = 60*MS,  .duration = 60*SEC, .tx_per_sec = 200, .min_delivered = 100 },
+  { .name = "flood",      .node_cnt = 5, .equiv_mask = 1UL<<4, .flood = 16,
                                       .lat_min = 20*MS,  .lat_max = 60*MS,  .duration = 60*SEC, .tx_per_sec = 200, .min_delivered = 100 },
   { .name = "restart",      .node_cnt = 5, .restart_mask = 1UL<<2, .crash_at = 20*SEC, .restart_at = 26*SEC,
                                       .lat_min = 20*MS,  .lat_max = 60*MS,  .duration = 60*SEC, .tx_per_sec = 200, .min_delivered = 100 },

@@ -1106,7 +1106,7 @@ api_status( daemon_t * d ) {
       "\"ledger_base_slot\":%lu,\"ledger_segments\":%lu,\"ledger_bytes\":%lu,\"ledger_pruned_segments\":%lu,\"history\":\"%s\","
       "\"metrics\":{\"blocks_built\":%lu,\"blocks_finalized\":%lu,\"fast_final_certs\":%lu,\"final_certs\":%lu,"
       "\"skip_certs\":%lu,\"standstills\":%lu,\"repair_reqs_sent\":%lu,\"bans\":%lu,"
-      "\"votes_restored\":%lu,\"votes_withheld\":%lu,\"blocks_withheld\":%lu,"
+      "\"votes_restored\":%lu,\"votes_withheld\":%lu,\"blocks_withheld\":%lu,\"blocks_refused\":%lu,"
       "\"frames_dropped\":%lu,\"disconnects\":%lu}}\n",
       state, d->own, rank==ULONG_MAX ? -1L : (long)rank, set->first_epoch, id, (uint)d->cluster->network_id, d->cluster->slot_ns/1000000L, set->epoch->validator_cnt,
       peers_ok( d ), finalized, vseq_ledger_cnt( d->ledger ),
@@ -1114,7 +1114,7 @@ api_status( daemon_t * d ) {
       vseq_ledger_base( d->ledger ).slot, ls.segments, ls.bytes, ls.pruned, d->history_full ? "full" : "recent",
       m->blocks_built, m->blocks_finalized, m->fast_final_certs, m->final_certs,
       m->skip_certs, m->standstills, m->repair_reqs_sent, m->bans,
-      m->votes_restored, m->votes_withheld, m->blocks_withheld,
+      m->votes_restored, m->votes_withheld, m->blocks_withheld, m->blocks_refused,
       mm->frames_dropped, mm->disconnects );
   return respond( d->api.http, 200 );
 }
