@@ -828,6 +828,16 @@ vseq_node_destroy( vseq_node_t * node ) {
   free( node );
 }
 
+/* hash_set_full: adding hash to set would use its last entry */
+
+static int
+hash_set_full( ag_block_hash_set_t const * set,
+               uchar const *               hash ) {
+  if( set->cnt+1UL<AG_EQVOC_BLOCK_HASH_MAX ) return 0;
+  for( ulong i=0UL; i<set->cnt; i++ ) if( !memcmp( set->hash[i], hash, sizeof(ag_block_hash_t) ) ) return 0;
+  return 1;
+}
+
 static void
 recv_vote( vseq_node_t * node,
            ulong         from,
@@ -843,8 +853,29 @@ recv_vote( vseq_node_t * node,
   if( FD_UNLIKELY( blst_p2_is_inf( ag_vote_sig( vote ) ) ) ) { ban_peer( node, from ); return; } /* never a valid signature */
   uchar const * block_hash = ag_vote_block_hash( vote );
   if( FD_UNLIKELY( block_hash && !memcmp( block_hash, ag_block_hash_null, sizeof(ag_block_hash_t) ) ) ) return;
-  ulong horizon = fd_ulong_max( ag_pool_finalized_slot( node->pool ), node->highest_parent_ready_slot ) + VOTE_LOOKAHEAD_MAX;
+  ulong finalized = ag_pool_finalized_slot( node->pool );
+  ulong horizon   = fd_ulong_max( finalized, node->highest_parent_ready_slot ) + VOTE_LOOKAHEAD_MAX;
   if( FD_UNLIKELY( ag_vote_slot( vote )>horizon ) ) return;
+  /* The pool keeps slot state for a few slots at and below the
+     finalized one too, and makes it before checking the signature.  A
+     vote on the finalized slot itself would give it a slot state with
+     no certs, which standstill recovery asserts against (fatal) when
+     the root is genesis, so no vote at or below finalized goes in. */
+  if( FD_UNLIKELY( ag_vote_slot( vote )<=finalized ) ) return;
+  /* The pool tracks at most AG_EQVOC_BLOCK_HASH_MAX hashes per slot
+     that 20% of stake voted notar on, and asserts (fatal) on more.
+     Enough for honest voters and under 20% byzantine stake, but
+     signatures are only checked once a quorum forms, and a voter whose
+     signature then fails may vote again: colluding validators of 40%
+     can leave a new unverified hash behind each round.  Leave the last
+     slot free rather than let a peer abort the node. */
+  if( vote->kind==AG_VOTE_KIND_NOTAR ) {
+    ag_slot_state_t const * st = ag_pool_slot_state( node->pool, ag_vote_slot( vote ) );
+    if( st && ( hash_set_full( &st->pending_safe_to_notar, block_hash ) || hash_set_full( &st->sent_safe_to_notar, block_hash ) ) ) {
+      node->metrics.votes_refused++;
+      return;
+    }
+  }
 
   uchar quorum_reached;
   ag_pool_add_vote( node->pool, vote, node->bad, &quorum_reached );
@@ -861,6 +892,7 @@ recv_cert( vseq_node_t * node,
   if( FD_UNLIKELY( ag_cert_de( cert, &bit_cnt, body, sz ) ) ) return;
   ulong slot = ag_cert_slot( cert );
   if( FD_UNLIKELY( ag_cert_shred_version( cert )!=node->cfg.network_id || bit_cnt>set_of( node, slot )->epoch->validator_cnt ) ) return;
+  if( FD_UNLIKELY( slot<=ag_pool_finalized_slot( node->pool ) ) ) return; /* as for votes */
 
   if( FD_UNLIKELY( ag_pool_add_cert( node->pool, cert, node->bad )==AG_POOL_ERR_CERT_VERIFY ) ) ban_peer( node, from );
   ban_bad_ranks( node, slot, node->bad );

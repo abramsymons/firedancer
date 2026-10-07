@@ -159,6 +159,7 @@ struct vseq_node_metrics {
   ulong votes_withheld;  /* own votes not sent: they conflict with a prior vote */
   ulong blocks_withheld; /* blocks not built: slot at or below the block floor's window */
   ulong blocks_refused;  /* blocks not stored: the leader sent too many for that slot */
+  ulong votes_refused;   /* notar votes dropped: too many hashes voted on in that slot */
 };
 typedef struct vseq_node_metrics vseq_node_metrics_t;
 

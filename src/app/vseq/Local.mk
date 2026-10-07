@@ -5,6 +5,7 @@ $(call make-bin,vseqd,vseqd,fd_vseq fd_choreo fd_waltz fd_tls fd_ballet fd_util)
 $(call make-unit-test,test_vseq_sim,test_vseq_sim,fd_vseq fd_choreo fd_ballet fd_util)
 $(call make-unit-test,test_vseq_ledger,test_vseq_ledger,fd_vseq fd_choreo fd_ballet fd_util)
 $(call run-unit-test,test_vseq_ledger)
+$(call make-fuzz-test,fuzz_vseq,fuzz_vseq,fd_vseq fd_choreo fd_ballet fd_util)
 
 # Client library for the SDKs (Python loads it with ctypes)
 VSEQ_CLIENT_FLAGS:=-Wl,--version-script=src/app/vseq/libvseq_client.map

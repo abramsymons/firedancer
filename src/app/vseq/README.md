@@ -108,6 +108,11 @@ $O/unit-test/test_vseq_ledger     # ledger crash recovery, pruning, follower
 python3 src/app/vseq/sdk/python/tests/test_sdk.py --vseqd $O/bin/vseqd --lib $O/lib/libvseq_client.so
 python3 src/app/vseq/test_vseqd_cluster.py --vseqd $O/bin/vseqd --restart-all   # also --kill-one, --restart-one, --rejoin-empty
 python3 src/app/vseq/test_vseqd_set_change.py --vseqd $O/bin/vseqd --lib $O/lib/libvseq_client.so
+
+# Fuzz everything parsed from the network (needs clang; see fuzz_vseq.c)
+make -j BUILDDIR=clang-fuzz-asan CC=clang EXTRAS="fuzz asan" fuzz_vseq
+FUZZ_VSEQ_SEED_DIR=corpus/fuzz_vseq build/clang-fuzz-asan/fuzz-test/fuzz_vseq -runs=0
+build/clang-fuzz-asan/fuzz-test/fuzz_vseq -max_total_time=600 corpus/fuzz_vseq
 ```
 
 ## Status
@@ -117,7 +122,7 @@ A prototype, not production ready. Known gaps:
 - Validator keys are plain files and in process memory; no remote signer.
 - Leaders send each block to every validator: fine for tens of
   validators, not hundreds (Firedancer's rotor would fix that).
-- No fuzzing or long adversarial runs yet.
+- No long adversarial runs yet.
 - No wire protocol versioning or metrics export yet.
 - Each node needs about 0.75 GB of memory (votor reserves room for 2,000
   validators in each of 64 tracked slots, `--slot-max`).

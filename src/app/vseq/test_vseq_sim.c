@@ -95,6 +95,7 @@ struct scenario {
   ulong        join_mask;          /* by node index */
   ulong        crash_idx_mask;     /* by node index: crash at crash_at, like restart_mask */
   ulong        lost_tail;          /* finalized log entries lost at the crash (an unsynced ledger tail) */
+  int          root_vote;          /* the last node sends everyone a signed skip vote on the finalized root slot at start */
 };
 typedef struct scenario scenario_t;
 
@@ -588,6 +589,18 @@ run( scenario_t const * sc,
   }
   for( ulong r=0UL; r<sim->n; r++ ) if( !sim->nodes[r].down ) node_start( sim, &sim->nodes[r] );
 
+  /* A vote on the root slot is useless but validly signed; a node must
+     survive it even if nothing finalizes for a while (standstill). */
+  if( sc->root_vote ) {
+    sim_node_t * sn   = &sim->nodes[ sim->n-1UL ];
+    ulong        rank = vseq_sched_set( sim->sched, 0UL )->rank_of_peer[ sn->peer ];
+    ag_vote_t    vote = ag_vote_construct_skip( sim_sign, &sn->cfg.bls_sec, sn->bls_pub, 0UL, (ushort)rank, (ushort)0x5e5e );
+    uchar        buf[ 1UL+AG_VOTE_SER_MAX ];
+    buf[0] = VSEQ_MSG_VOTE;
+    ulong sz = 1UL+ag_vote_ser( &vote, buf+1UL );
+    for( ulong r=0UL; r<sim->n; r++ ) if( r!=sn->peer && !sim->nodes[r].down ) sim_deliver( sim, sn, r, buf, sz );
+  }
+
   /* Event loop */
 
   long end     = SEC + duration;
@@ -808,6 +821,10 @@ static scenario_t const scenarios[] = {
   { .name = "set-change", .node_cnt = 6, .epoch_slots = 32, .change_epoch = 2, .leave_mask = 1UL<<0, .join_mask = 1UL<<5,
                                       .crash_idx_mask = 0x7UL, .crash_at = 35*SEC, .restart_at = 1000*SEC,
                                       .lat_min = 20*MS,  .lat_max = 60*MS,  .duration = 70*SEC, .tx_per_sec = 200, .min_delivered = 110 },
+  /* Half the stake is down, so nothing finalizes and every node hits
+     the standstill timeout with a vote on the root slot in its pool */
+  { .name = "root-vote-standstill", .node_cnt = 4, .down_mask = (1UL<<0)|(1UL<<1), .root_vote = 1,
+                                      .lat_min = 20*MS,  .lat_max = 60*MS,  .duration = 25*SEC, .tx_per_sec = 10 },
   { .name = "stake",   .node_cnt = 7, .stake = { 30, 20, 15, 10, 10, 10, 5 }, .down_mask = 1UL<<6,
                                       .lat_min = 20*MS,  .lat_max = 60*MS,  .duration = 60*SEC, .tx_per_sec = 200, .min_delivered = 100 },
 };

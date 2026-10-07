@@ -253,7 +253,7 @@ FLOOR), compacted to those above the finalized root.
 - Tx submission is not censorship resistant beyond leader rotation: a
   dApp sends each tx to the next few leaders and resends if needed.
   Pending txs live in leader memory and are lost if the leader crashes.
-- Not done yet: remote signing and key protection, fuzzing, protocol
+- Not done yet: remote signing and key protection, protocol
   versioning, metrics export, rotor. Upstream votor is still in
   development (Alpenglow is not active on Solana mainnet), so expect
   API changes when rebasing.
@@ -276,3 +276,4 @@ FLOOR), compacted to those above the finalized root.
 | `sdk/python/tests/test_sdk.py` | proof checks, tampered data, lying nodes, API keys |
 | `test_vseqd_cluster.py` | real processes: kill, restart, restart all, rejoin with an empty ledger, pruning |
 | `test_vseqd_set_change.py` | real processes: a validator joins, one leaves, a node with the old config is cut off |
+| `fuzz_vseq` | libFuzzer: block, ledger record and cert parsing, and any peer message into a live node |
