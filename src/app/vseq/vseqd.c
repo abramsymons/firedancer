@@ -618,7 +618,7 @@ struct daemon {
 
   struct {
     int           active;      /* consensus stopped, catching up */
-    int           probing;     /* consensus running, asked a peer how far ahead it is */
+    int           probing;     /* consensus running, asked a peer for its latest finalized block */
     int           from_tip;    /* empty ledger: start at a peer's latest finalized block */
     ulong         peer;        /* rank asked, ULONG_MAX if none */
     ulong         next_peer;
@@ -660,6 +660,7 @@ static void hello_recv( daemon_t * d, ulong from, uchar const * body, ulong sz )
 static ulong peers_ok( daemon_t const * d );
 static void sync_serve( daemon_t * d, ulong from, uchar const * body, ulong sz );
 static void sync_block( daemon_t * d, uchar const * body, ulong sz );
+static void probe_block( daemon_t * d, uchar const * body, ulong sz );
 static void sync_end  ( daemon_t * d, uchar const * body, ulong sz );
 
 static void
@@ -672,7 +673,7 @@ mesh_recv( void *        ctx,
   if( FD_UNLIKELY( !d->hello_ok[ from ] ) ) return; /* not known to share our validator set yet */
   switch( msg[0] ) {
   case VSEQ_MSG_SYNC_REQ:   sync_serve( d, from, msg+1UL, sz-1UL ); return;
-  case VSEQ_MSG_SYNC_BLOCK: if( d->sync.active && from==d->sync.peer ) sync_block( d, msg+1UL, sz-1UL ); return;
+  case VSEQ_MSG_SYNC_BLOCK: if( from==d->sync.peer ) { if( d->sync.active ) sync_block( d, msg+1UL, sz-1UL ); else if( d->sync.probing ) probe_block( d, msg+1UL, sz-1UL ); } return;
   case VSEQ_MSG_SYNC_END:   if( ( d->sync.active || d->sync.probing ) && from==d->sync.peer ) sync_end( d, msg+1UL, sz-1UL ); return;
   default: break;
   }
@@ -978,12 +979,40 @@ bad:
   sync_ask( d, sync_after( d ), SYNC_BATCH, 1 );
 }
 
+/* probe_block handles the latest finalized block a peer sent while
+   consensus is running and stalled (sync_tick).  Only a block whose
+   certs verify counts: if it is further ahead than consensus can
+   repair, stop consensus and catch up.  A peer's bare claim of a slot
+   (SYNC_END) is never acted on, so no single peer can make us leave
+   consensus by lying. */
+
+static void
+probe_block( daemon_t *    d,
+             uchar const * rec_buf,
+             ulong         sz ) {
+  vseq_ledger_rec_t rec;
+  ag_block_hash_t   hash;
+  d->sync.probing = 0;
+  if( FD_UNLIKELY( vseq_ledger_rec_parse( rec_buf, sz, &rec ) ) ) return;
+  vseq_block_hash( rec.block.slot, &rec.block.parent, rec.block.payload, rec.block.payload_sz, hash );
+  if( FD_UNLIKELY( memcmp( hash, rec.hash, sizeof(ag_block_hash_t) ) ) ) return;
+  if( FD_UNLIKELY( !rec.proof_sz || vseq_proof_verify( vseq_sched_set( d->sched, rec.block.slot )->epoch, d->cluster->network_id, rec.block.slot, hash, rec.proof, rec.proof_sz, d->cert ) ) ) return;
+
+  ulong delivered = vseq_node_delivered_slot( d->node );
+  if( rec.block.slot>delivered+d->cfg->slot_max/2UL ) {
+    FD_LOG_WARNING(( "fell behind: finalized slot %lu, peer %lu proved slot %lu final; restarting consensus after catching up", delivered, d->sync.peer, rec.block.slot ));
+    vseq_node_destroy( d->node );
+    d->node = NULL;
+    sync_start( d );
+  }
+}
+
 /* sync_end handles a peer's tip and base (the block its oldest kept
    record builds on).  While syncing: if the peer pruned past our
    ledger, start an empty ledger at its base or try another peer;
    otherwise start consensus once near its tip, or ask for more.  While
-   probing: if the peer is further ahead than consensus can repair,
-   stop consensus and sync. */
+   probing it only ends the probe: the peer's tip is a claim, and
+   probe_block has already acted on its proved block if there was one. */
 
 static void
 sync_end( daemon_t *    d,
@@ -1027,13 +1056,7 @@ sync_end( daemon_t *    d,
     }
   } else if( d->sync.probing ) {
     d->sync.probing = 0;
-    ulong delivered = vseq_node_delivered_slot( d->node );
-    if( tip>delivered+d->cfg->slot_max/2UL ) {
-      FD_LOG_WARNING(( "fell behind: finalized slot %lu, peer %lu is at %lu; restarting consensus after catching up", delivered, d->sync.peer, tip ));
-      vseq_node_destroy( d->node );
-      d->node = NULL;
-      sync_start( d );
-    }
+    (void)tip;
   }
 }
 
@@ -1050,7 +1073,8 @@ sync_tick( daemon_t * d ) {
     return;
   }
 
-  /* Consensus running: if finalization stalls, check whether peers are
+  /* Consensus running: if finalization stalls, ask a peer for its
+     latest finalized block (with certs) to see whether the network is
      ahead of what the pool can accept. */
   ulong delivered = vseq_node_delivered_slot( d->node );
   if( delivered!=d->sync.last_delivered ) { d->sync.last_delivered = delivered; d->sync.last_progress = d->now; }
@@ -1058,7 +1082,7 @@ sync_tick( daemon_t * d ) {
   if( !d->sync.probing && d->now-d->sync.last_progress>=PROBE_NS ) {
     d->sync.probing       = 1;
     d->sync.last_progress = d->now;
-    sync_ask( d, delivered, 0UL, 1 );
+    sync_ask( d, SYNC_TIP, 1UL, 1 );
   }
 }
 

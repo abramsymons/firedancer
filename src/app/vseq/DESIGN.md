@@ -163,7 +163,7 @@ validator that skipped a required upgrade on any chain.
 | Leader floods signed junk blocks for its slots | at most 4 stored per slot (6 if the pool asks for one by hash), the rest refused; only the slot's leader can sign for it, so no other validator's block is affected (`flood` scenario) |
 | Node crash and restart | reopen the ledger (torn tail cut), reload the vote history, catch up from peers if behind |
 | Whole cluster restarts at once | each node resumes from its own ledger and history; finalization resumes, no conflicting votes |
-| Node far behind (more than `--slot-max`) | stops consensus, fetches finalized blocks from peers (`SYNC_REQ`), checks their certs, then rejoins |
+| Node far behind (more than `--slot-max`) | after 15 s without finalization it asks a peer for its latest finalized block; if that block's certs verify and it is far ahead, it stops consensus, fetches finalized blocks from peers (`SYNC_REQ`), checks their certs, then rejoins. A peer's bare claim of a slot is never acted on |
 | Node starts with an empty ledger | `--history recent`: start from a peer's latest finalized block, checked by its certs; `--history full`: fetch everything peers keep |
 | Peers pruned the history we need | logged clearly; the node waits (restore segments, or rejoin with an empty ledger) |
 | Peer lies about where its history starts (`--history full`, empty ledger) | its claimed base is only written to the ledger once a batch from it verifies; otherwise the node moves to the next peer |
