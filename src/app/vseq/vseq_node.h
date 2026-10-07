@@ -117,8 +117,10 @@ struct vseq_node_cfg {
      vote with the block it is for: once a block may be finalized, its
      voters must be able to produce it, even if every node restarts.
      On restart, pass them back as prior_blocks and prior_votes, framed
-     as (uint sz, bytes); ones at or below the root are ignored.  The
-     blocks go back into the block store.  The votes  They go
+     as (uint sz, bytes); ones at or below the root are ignored, and
+     ones the pool cannot hold (slot_max-8 or more slots above the
+     root) fail creation: the node must not forget what it signed.  The
+     blocks go back into the block store.  The votes go
      into the pool as ours and are sent again, so certs can still form
      from them, and the pool then rejects any new vote of ours that
      would conflict with them (ag_slot_state_check_slashable_offence);

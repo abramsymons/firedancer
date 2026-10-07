@@ -20,7 +20,10 @@
    Restarting nodes crash (the node is destroyed, messages to it are
    lost) and come back from their finalized log, the certs of the last
    logged block, the votes they persisted and their block floor, as
-   vseqd does from its ledger and vote history file.
+   vseqd does from its ledger and vote history file.  With lost_tail,
+   the crash also drops that many blocks from the end of the log, like
+   a power loss taking the part of the ledger not yet synced; the run
+   then checks that every lost block is finalized again, unchanged.
 
    An equivocating leader sends a second, differently signed version of
    each of its blocks (one extra tx) to the ranks in equiv_dst_mask,
@@ -86,6 +89,7 @@ struct scenario {
   ulong        leave_mask;         /* by node index */
   ulong        join_mask;          /* by node index */
   ulong        crash_idx_mask;     /* by node index: crash at crash_at, like restart_mask */
+  ulong        lost_tail;          /* finalized log entries lost at the crash (an unsynced ledger tail) */
 };
 typedef struct scenario scenario_t;
 
@@ -112,6 +116,11 @@ struct sim_node {
   ulong *         log_slot;
   ag_block_hash_t * log_hash;
   ulong           log_cnt;
+  uchar **        log_proof;    /* per entry, so a truncated log still ends with certs */
+  ulong *         log_proof_sz;
+  ulong *         lost_slot;    /* entries dropped by lost_tail */
+  ag_block_hash_t * lost_hash;
+  ulong           lost_cnt;
   uchar           id_sec[ 32 ];
   uchar           id_pub[ 32 ];
   ag_bls_key_t    bls_pub;
@@ -337,6 +346,10 @@ sim_finalized( void *               ctx,
   FD_TEST( sn->log_cnt<LOG_MAX );
   sn->log_slot[ sn->log_cnt ] = block->slot;
   memcpy( sn->log_hash[ sn->log_cnt ], hash, sizeof(ag_block_hash_t) );
+  sn->log_proof[ sn->log_cnt ] = realloc( sn->log_proof[ sn->log_cnt ], VSEQ_PROOF_MAX );
+  FD_TEST( sn->log_proof[ sn->log_cnt ] );
+  memcpy( sn->log_proof[ sn->log_cnt ], proof, proof_sz );
+  sn->log_proof_sz[ sn->log_cnt ] = proof_sz;
   sn->log_cnt++;
 
   ulong off = 0UL, tx_sz;
@@ -380,6 +393,32 @@ inject_tx( sim_t * sim ) {
     sent[ sent_cnt++ ] = leader;
     if( !sim->nodes[ leader ].down ) vseq_node_submit_tx( sim->nodes[ leader ].node, tx, TX_SZ );
   }
+}
+
+/* lose_tail drops the last sc->lost_tail entries of sn's log, and then
+   any more without their own certs, so the log still ends with a block
+   that has them, as a ledger does. */
+
+static void
+lose_tail( sim_t *      sim,
+           sim_node_t * sn ) {
+  ulong keep = fd_ulong_sat_sub( sn->log_cnt, sim->sc->lost_tail );
+  while( keep && !sn->log_proof_sz[ keep-1UL ] ) keep--;
+  for( ulong i=keep; i<sn->log_cnt; i++ ) {
+    sn->lost_slot[ sn->lost_cnt ] = sn->log_slot[i];
+    memcpy( sn->lost_hash[ sn->lost_cnt ], sn->log_hash[i], sizeof(ag_block_hash_t) );
+    sn->lost_cnt++;
+  }
+  sn->log_cnt = keep;
+  if( keep ) {
+    sn->last_proof_sz = sn->log_proof_sz[ keep-1UL ];
+    memcpy( sn->last_proof, sn->log_proof[ keep-1UL ], sn->last_proof_sz );
+    sn->last = ag_block_id( sn->log_slot[ keep-1UL ], sn->log_hash[ keep-1UL ] );
+  } else {
+    sn->last_proof_sz = 0UL;
+    sn->last          = ag_block_id( 0UL, ag_block_hash_null );
+  }
+  FD_LOG_NOTICE(( "[%s]   peer %lu loses the last %lu finalized blocks, its log now ends at slot %lu", sim->sc->name, sn->peer, sn->lost_cnt, sn->last.slot ));
 }
 
 /* node_start creates sn's node from genesis, or after a crash from its
@@ -474,7 +513,11 @@ run( scenario_t const * sc,
     sn->last     = ag_block_id( 0UL, ag_block_hash_null );
     sn->log_slot = malloc( LOG_MAX*sizeof(ulong) );
     sn->log_hash = malloc( LOG_MAX*sizeof(ag_block_hash_t) );
-    FD_TEST( sn->log_slot && sn->log_hash );
+    sn->log_proof    = calloc( LOG_MAX, sizeof(uchar *) );
+    sn->log_proof_sz = calloc( LOG_MAX, sizeof(ulong)   );
+    sn->lost_slot    = malloc( LOG_MAX*sizeof(ulong)           );
+    sn->lost_hash    = malloc( LOG_MAX*sizeof(ag_block_hash_t) );
+    FD_TEST( sn->log_slot && sn->log_hash && sn->log_proof && sn->log_proof_sz && sn->lost_slot && sn->lost_hash );
     memcpy( sn->id_sec,  id_sec[i],            32UL );
     memcpy( sn->id_pub,  members[i].v.id_key,  32UL );
     memcpy( sn->bls_pub, members[i].v.bls_key, sizeof(ag_bls_key_t) );
@@ -542,6 +585,7 @@ run( scenario_t const * sc,
           uchar     ser[ AG_VOTE_SER_MAX ];
           append( &sn->votes, &sn->votes_sz, &sn->votes_max, ser, ag_vote_ser( &vote, ser ) );
         }
+        if( sc->lost_tail ) lose_tail( sim, sn );
         vseq_node_destroy( sn->node );
         sn->node = NULL;
         sn->down = 1;
@@ -586,6 +630,28 @@ run( scenario_t const * sc,
           i++; j++;
         }
       }
+    }
+  }
+
+  /* Safety: blocks lost from a log were finalized again, unchanged */
+
+  for( ulong r=0UL; r<sim->n; r++ ) {
+    sim_node_t const * sn = &sim->nodes[r];
+    ulong missing = 0UL, changed = 0UL;
+    for( ulong i=0UL; i<sn->lost_cnt; i++ ) {
+      int found = 0, same = 0;
+      for( ulong j=0UL; j<sn->log_cnt && !found; j++ ) {
+        if( sn->log_slot[j]!=sn->lost_slot[i] ) continue;
+        found = 1;
+        same  = !memcmp( sn->log_hash[j], sn->lost_hash[i], sizeof(ag_block_hash_t) );
+      }
+      missing += !found;
+      changed += found && !same;
+    }
+    if( FD_UNLIKELY( missing || changed ) ) {
+      FD_LOG_WARNING(( "[%s] SAFETY: peer %lu lost %lu finalized blocks; %lu were never finalized again and %lu were finalized as another block",
+                       sc->name, r, sn->lost_cnt, missing, changed ));
+      sim->fail = 1;
     }
   }
 
@@ -651,6 +717,11 @@ run( scenario_t const * sc,
   for( ulong r=0UL; r<sim->n; r++ ) {
     vseq_node_destroy( sim->nodes[r].node );
     free( sim->nodes[r].log_slot );
+    for( ulong i=0UL; i<LOG_MAX; i++ ) free( sim->nodes[r].log_proof[i] );
+    free( sim->nodes[r].log_proof );
+    free( sim->nodes[r].log_proof_sz );
+    free( sim->nodes[r].lost_slot );
+    free( sim->nodes[r].lost_hash );
     free( sim->nodes[r].track );
     free( sim->nodes[r].votes );
     free( sim->nodes[r].blocks );
@@ -683,6 +754,10 @@ static scenario_t const scenarios[] = {
   { .name = "restart-conflict", .node_cnt = 5, .restart_mask = 1UL<<2, .crash_at = 20*SEC, .restart_at = 20*SEC+300*MS, .inject_skips = 8,
                                       .lat_min = 20*MS,  .lat_max = 60*MS,  .duration = 60*SEC, .tx_per_sec = 200, .min_delivered = 100 },
   { .name = "restart-all",  .node_cnt = 5, .restart_mask = 0x1fUL, .crash_at = 20*SEC, .restart_at = 21*SEC,
+                                      .lat_min = 20*MS,  .lat_max = 60*MS,  .duration = 60*SEC, .tx_per_sec = 200, .min_delivered = 100 },
+  /* Every node also loses the last slot_max/2 finalized blocks, the
+     most vseqd lets the ledger fall behind the vote history */
+  { .name = "restart-all-lost-tail", .node_cnt = 5, .restart_mask = 0x1fUL, .crash_at = 20*SEC, .restart_at = 21*SEC, .lost_tail = 16,
                                       .lat_min = 20*MS,  .lat_max = 60*MS,  .duration = 60*SEC, .tx_per_sec = 200, .min_delivered = 100 },
   /* Node 0 leaves and node 5 joins at slot 64.  Then nodes 0-2 crash:
      the new set {1..5} keeps 60% only if node 5 votes. */

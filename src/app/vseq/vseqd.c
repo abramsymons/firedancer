@@ -80,15 +80,25 @@
                    durable before the vote is sent.  On restart they go
                    back into consensus so the node cannot contradict
                    itself.  Losing it while keeping the ledger is
-                   refused: the node could double vote.
+                   refused: the node could double vote.  So is the
+                   other way round, a ledger that ends more than
+                   --slot-max minus 8 slots below the last vote in the
+                   file (an old copy restored by hand): the node could
+                   not replay those votes and might contradict them.
+                   Restore the ledger that goes with the vote history,
+                   or start over with neither.
 
    Durability: a finalized block was voted for by at least 60% of
    stake, and each voter made its vote and the block durable first, so
    even if every node loses power the network finalizes the same block
-   again.  The ledger is only synced when a segment is sealed and right
+   again.  The ledger is not synced per block: it is synced every
+   slot_max/2 finalized slots, when a segment is sealed, and right
    before the vote history drops what the ledger holds (on open, when
-   consensus starts, and every COMPACT_SLOTS), so a block is always on
-   disk in one of the two.
+   consensus starts, and every COMPACT_SLOTS).  So a block is always on
+   disk in one of the two, and the ledger is never more than slot_max/2
+   slots behind the vote history, which is what a restart can replay
+   (votor tracks slot_max slots above the root). A ledger further
+   behind, e.g. restored from an old copy, is refused at startup.
 
    Restart: run the same command again.  The node reopens the ledger,
    catches up from peers if it is behind (blocks are checked against
@@ -601,6 +611,7 @@ struct daemon {
 
   vseq_history_t *   history;
   ulong              compact_root;
+  ulong              ledger_synced; /* delivered slot at the last ledger sync */
   ulong              retain_slots; /* prune ledger segments this far behind, 0 keeps all */
   int                history_full; /* an empty ledger fetches all history peers keep */
 
@@ -722,6 +733,7 @@ start_node( daemon_t * d ) {
   d->cfg->prior_blocks  = vseq_history_prior_blocks( d->history, &d->cfg->prior_blocks_sz );
   d->cfg->block_floor   = vseq_history_block_floor ( d->history );
   d->compact_root       = root.slot;
+  d->ledger_synced      = root.slot;
   d->node = vseq_node_create( d->cfg, d->now );
   if( FD_UNLIKELY( !d->node ) ) FD_LOG_ERR(( "cannot start consensus at slot %lu", root.slot ));
   d->sync.active         = 0;
@@ -1309,10 +1321,15 @@ cmd_run( int     argc,
     deadline = fd_long_min( vseq_node_service( d.node, d.now ), mesh_next );
 
     ulong delivered = vseq_node_delivered_slot( d.node );
+    if( FD_UNLIKELY( delivered>=d.ledger_synced+slot_max/2UL ) ) {
+      vseq_ledger_sync( d.ledger ); /* keep the ledger within what a restart can replay */
+      d.ledger_synced = delivered;
+    }
     if( FD_UNLIKELY( delivered>=d.compact_root+COMPACT_SLOTS ) ) {
       vseq_ledger_sync( d.ledger );
       vseq_history_compact( d.history, delivered );
-      d.compact_root = delivered;
+      d.compact_root  = delivered;
+      d.ledger_synced = delivered;
     }
     if( d.retain_slots && delivered>d.retain_slots ) {
       ulong removed = vseq_ledger_prune( d.ledger, delivered-d.retain_slots );

@@ -133,10 +133,17 @@ the history while keeping the ledger is refused at startup.
 block was voted for by at least 60% of stake, and each voter saved it
 with its vote first. So after a power loss everywhere, the network
 finalizes the same block again from the vote histories. The ledger is
-not synced per block; it is synced when a segment is sealed and right
-before the vote history drops anything the ledger holds (on open, when
-consensus starts, and every 512 slots). A block is therefore always on
-disk in one of the two.
+not synced per block; it is synced every `--slot-max`/2 finalized
+slots, when a segment is sealed, and right before the vote history
+drops anything the ledger holds (on open, when consensus starts, and
+every 512 slots). A block is therefore always on disk in one of the
+two, and the ledger is never more than `--slot-max`/2 slots behind the
+votes. That bound matters: on restart the node reloads its old votes
+and blocks into votor, which tracks `--slot-max` slots above the root,
+so a ledger further behind (an old copy restored by hand) would leave
+votes the node could later contradict; `vseq_node_create` refuses to
+start in that case. The simulator's `restart-all-lost-tail` scenario
+covers a whole-cluster restart with that much ledger tail lost.
 
 **Nodes on different configs never work together.** The config is part
 of the release. After connecting, and again every epoch, peers exchange
@@ -158,6 +165,7 @@ validator that skipped a required upgrade on any chain.
 | Node far behind (more than `--slot-max`) | stops consensus, fetches finalized blocks from peers (`SYNC_REQ`), checks their certs, then rejoins |
 | Node starts with an empty ledger | `--history recent`: start from a peer's latest finalized block, checked by its certs; `--history full`: fetch everything peers keep |
 | Peers pruned the history we need | logged clearly; the node waits (restore segments, or rejoin with an empty ledger) |
+| Ledger far older than the vote history (an old copy restored by hand) | refused at startup with the slot that does not fit; restore the matching ledger, or start over with neither file |
 | Validator set change | at the epoch boundary; leavers stay connected one more epoch, joiners connect one epoch early |
 | Peer with a different config | disconnected at the set-hash check, with a log line saying why |
 | API flood | at most 16 HTTP events per loop pass; API keys with per-dApp rate limits |

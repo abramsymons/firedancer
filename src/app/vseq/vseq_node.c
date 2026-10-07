@@ -265,17 +265,23 @@ note_block( vseq_node_t * node,
 /* Blocks *************************************************************/
 
 /* replay tells votor a block is available.  It plays the role of
-   Firedancer's replay tile, minus execution. */
+   Firedancer's replay tile, minus execution.  Returns 0, or the pool
+   error if the pool does not track the block's slot yet (too far above
+   the root, or in a set it has not been given): votor is not told
+   either, since its slot table is bounded the same way, and the caller
+   retries once the root has advanced. */
 
-static void
+static int
 replay( vseq_node_t * node,
         blk_t const * blk ) {
-  ag_pool_add_block( node->pool, &blk->id, &blk->parent, node->bad );
+  int err = ag_pool_add_block( node->pool, &blk->id, &blk->parent, node->bad );
   ban_bad_ranks( node, blk->id.slot, node->bad );
+  if( FD_UNLIKELY( err ) ) return err;
 
   ag_block_info_t info = { .parent = blk->parent };
   memcpy( info.hash, blk->id.hash, sizeof(ag_block_hash_t) );
   ag_votor_process_replay( node->votor, blk->id.slot, &info );
+  return 0;
 }
 
 /* try_complete marks blk complete once its parent is, then does the
@@ -299,9 +305,9 @@ try_complete( vseq_node_t * node,
       else    repair_request( node, &b->parent );
     }
     if( !parent_ok ) continue;
+    if( FD_UNLIKELY( replay( node, b ) ) ) continue; /* retried by retry_incomplete */
 
     b->complete = 1;
-    replay( node, b );
 
     for( blk_map_iter_t iter = blk_map_iter_init( node->blk_map, node->blks );
                               !blk_map_iter_done( iter, node->blk_map, node->blks );
@@ -309,6 +315,19 @@ try_complete( vseq_node_t * node,
       blk_t * child = blk_map_iter_ele( iter, node->blk_map, node->blks );
       if( !child->complete && ag_block_id_eq( &child->parent, &b->id ) && cnt<node->blk_max ) stack[ cnt++ ] = child;
     }
+  }
+}
+
+/* retry_incomplete gives every stored block that is not complete
+   another chance, e.g. after the root advanced into its slot's range. */
+
+static void
+retry_incomplete( vseq_node_t * node ) {
+  for( blk_map_iter_t iter = blk_map_iter_init( node->blk_map, node->blks );
+                            !blk_map_iter_done( iter, node->blk_map, node->blks );
+                      iter = blk_map_iter_next( iter, node->blk_map, node->blks ) ) {
+    blk_t * b = blk_map_iter_ele( iter, node->blk_map, node->blks );
+    if( !b->complete ) try_complete( node, b );
   }
 }
 
@@ -701,11 +720,22 @@ vseq_node_create( vseq_node_cfg_t const * cfg,
   if( node->quiet_until ) FD_LOG_NOTICE(( "restart: building no blocks at or below slot %lu", node->quiet_until ));
 
   /* Restore the blocks we voted for before the restart, then the votes
-     (see cfg): votes into the pool as ours, and out again. */
+     (see cfg): votes into the pool as ours, and out again.  Anything
+     above what the pool can hold would be forgotten, and the node
+     could then contradict it, so that fails instead (the caller must
+     restore the ledger tail, or raise slot_max). */
 
+  ulong window_end = node->root.slot + cfg->slot_max - AG_REWARD_SLOT_DELTA; /* ag_pool_add_vote's bound */
   for( ulong off=0UL; off+sizeof(uint)<=cfg->prior_blocks_sz; ) {
     ulong sz = FD_LOAD( uint, cfg->prior_blocks+off );
     if( FD_UNLIKELY( off+sizeof(uint)+sz>cfg->prior_blocks_sz || sz>VSEQ_BLOCK_HDR_SZ+cfg->payload_max ) ) break;
+    ulong slot = sz>=sizeof(ulong) ? FD_LOAD( ulong, cfg->prior_blocks+off+sizeof(uint) ) : 0UL;
+    if( FD_UNLIKELY( slot>=window_end ) ) {
+      FD_LOG_WARNING(( "the vote history has a block for slot %lu, more than slot_max-%lu slots above the root slot %lu: the ledger lost too much; restore it or raise slot_max",
+                       slot, AG_REWARD_SLOT_DELTA, node->root.slot ));
+      vseq_node_destroy( node );
+      return NULL;
+    }
     node->build_buf[0] = VSEQ_MSG_BLOCK;
     memcpy( node->build_buf+1UL, cfg->prior_blocks+off+sizeof(uint), sz );
     on_block( node, node->build_buf, 1UL+sz, 0 );
@@ -724,7 +754,15 @@ vseq_node_create( vseq_node_cfg_t const * cfg,
     if( FD_UNLIKELY( rank==USHORT_MAX ) ) continue;
     set_vote_rank( vote, (ushort)rank );
     uchar quorum_reached;
-    if( FD_UNLIKELY( ag_pool_add_vote( node->pool, vote, node->bad, &quorum_reached ) ) ) continue;
+    int   err = ag_pool_add_vote( node->pool, vote, node->bad, &quorum_reached );
+    if( FD_UNLIKELY( err==AG_POOL_ERR_DUPLICATE ) ) continue;
+    if( FD_UNLIKELY( err ) ) {
+      char cstr[ AG_VOTE_CSTR_MAX ];
+      FD_LOG_WARNING(( "cannot restore prior vote %s (%s): the ledger lost too much since it was cast; restore it or raise slot_max",
+                       ag_vote_to_cstr( vote, cstr ), ag_pool_strerror( err ) ));
+      vseq_node_destroy( node );
+      return NULL;
+    }
     node->msg[0] = VSEQ_MSG_VOTE;
     memcpy( node->msg+1UL, ser, sz );
     send_msg( node, VSEQ_DST_ALL, node->msg, 1UL+sz );
@@ -874,7 +912,9 @@ vseq_node_service( vseq_node_t * node,
     node->last_final_slot = fin_slot;
     node->last_final_ts   = now;
   }
+  ulong delivered_before = node->delivered.slot;
   deliver_finalized( node );
+  if( node->delivered.slot!=delivered_before ) retry_incomplete( node );
 
   /* Once the root is in the next set, give votor the one after */
   while( node->next_set && node->delivered.slot>=node->next_set->start_slot ) {
