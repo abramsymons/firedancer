@@ -1,3 +1,7 @@
+> **This fork adds [vseq](src/app/vseq/README.md): Firedancer's Alpenglow consensus (votor) run as a standalone ordering service.**
+> The network only orders transactions; each app replica verifies BLS finality proofs and executes them itself, in the model of [Zellular](https://github.com/zellular-xyz/zsequencer)'s consensus as a service.
+> Start with the [README](src/app/vseq/README.md) and the [design doc](src/app/vseq/DESIGN.md). Everything below is upstream Firedancer's README.
+
 # [Firedancer](https://jumpcrypto.com/firedancer/) 🔥💃
 
 Firedancer is a new validator client for Solana.
