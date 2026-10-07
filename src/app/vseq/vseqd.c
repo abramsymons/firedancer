@@ -604,6 +604,7 @@ struct daemon {
   ulong              wall_epoch;  /* epoch by the clock, ULONG_MAX before the first peers_tick */
   uchar *            hello_sent;  /* by peer: we sent our set hash on this connection */
   uchar *            hello_ok;    /* by peer: its set hash matches ours */
+  ulong *            hello_gen;   /* by peer: the connection (vseq_mesh_peer_conn_gen) hello_sent and hello_ok are about */
   long               now;
   uchar *            span;     /* sync records */
   uchar *            msg;      /* outgoing sync message */
@@ -749,7 +750,9 @@ start_node( daemon_t * d ) {
    connecting, and again at every epoch, each sends HELLO with the hash
    of its set for its current epoch (by the clock).  A peer whose set
    differs is disconnected; until its HELLO matches, its messages are
-   dropped. */
+   dropped.  Hello state is per connection: a peer that reconnects
+   (even replacing a connection that still looked alive on our side)
+   gets a fresh HELLO and must send its own again. */
 
 static ulong
 wall_epoch( daemon_t const * d ) {
@@ -769,6 +772,8 @@ hello_recv( daemon_t *    d,
             uchar const * body,
             ulong         sz ) {
   if( FD_UNLIKELY( sz!=40UL ) ) { vseq_mesh_close( d->mesh, from, "bad hello" ); return; }
+  ulong gen = vseq_mesh_peer_conn_gen( d->mesh, from );
+  if( gen!=d->hello_gen[ from ] ) { d->hello_gen[ from ] = gen; d->hello_sent[ from ] = 0; } /* its HELLO may beat peers_tick to the new connection */
   ulong epoch = FD_LOAD( ulong, body );
   if( FD_UNLIKELY( memcmp( set_of_epoch( d, epoch )->hash, body+8UL, 32UL ) ) ) {
     FD_LOG_WARNING(( "peer %lu has another validator set for epoch %lu: its cluster.toml differs from ours", from, epoch ));
@@ -799,6 +804,8 @@ peers_tick( daemon_t * d ) {
   for( ulong p=0UL; p<d->sched->peer_cnt; p++ ) {
     if( p==d->own ) continue;
     if( !vseq_mesh_peer_connected( d->mesh, p ) ) { d->hello_sent[p] = d->hello_ok[p] = 0; continue; }
+    ulong gen = vseq_mesh_peer_conn_gen( d->mesh, p );
+    if( gen!=d->hello_gen[p] ) { d->hello_gen[p] = gen; d->hello_sent[p] = d->hello_ok[p] = 0; }
     if( d->hello_sent[p] ) continue;
     d->msg[0] = VSEQ_MSG_HELLO;
     FD_STORE( ulong, d->msg+1UL, epoch );
@@ -1219,7 +1226,8 @@ cmd_run( int     argc,
   d.wall_epoch = ULONG_MAX;
   d.hello_sent = calloc( sched->peer_cnt, 1UL );
   d.hello_ok   = calloc( sched->peer_cnt, 1UL );
-  FD_TEST( d.hello_sent && d.hello_ok );
+  d.hello_gen  = calloc( sched->peer_cnt, sizeof(ulong) );
+  FD_TEST( d.hello_sent && d.hello_ok && d.hello_gen );
   d.now     = fd_log_wallclock();
   ulong frame_max = 1UL+VSEQ_LEDGER_REC_SZ( cluster.payload_max, VSEQ_PROOF_MAX ); /* SYNC_BLOCK is the largest */
   d.msg     = malloc( frame_max );

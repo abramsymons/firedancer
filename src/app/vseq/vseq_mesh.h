@@ -88,8 +88,14 @@ vseq_mesh_send( vseq_mesh_t * mesh,
 void vseq_mesh_set_active( vseq_mesh_t * mesh, ulong peer, int active );
 void vseq_mesh_close     ( vseq_mesh_t * mesh, ulong peer, char const * why );
 
+/* vseq_mesh_peer_conn_gen counts the connections to peer that became
+   ready, so a caller can tell a new one from the last it saw even when
+   the new one replaced the old between two calls (the peer dialed
+   again while the old socket still looked alive). */
+
 ulong                       vseq_mesh_connected_cnt( vseq_mesh_t const * mesh );
 int                         vseq_mesh_peer_connected( vseq_mesh_t const * mesh, ulong peer );
+ulong                       vseq_mesh_peer_conn_gen( vseq_mesh_t const * mesh, ulong peer );
 vseq_mesh_metrics_t const * vseq_mesh_metrics      ( vseq_mesh_t const * mesh );
 
 FD_PROTOTYPES_END

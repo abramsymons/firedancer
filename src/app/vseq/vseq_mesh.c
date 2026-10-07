@@ -67,6 +67,7 @@ struct __attribute__((aligned(FD_SHA512_ALIGN))) vseq_mesh {
   long                now;
 
   conn_t **           by_rank;   /* the conn to each peer, if any */
+  ulong *             conn_gen;  /* by peer: bumped each time a connection to it becomes ready */
   uchar *             active;    /* peers we keep connections with */
   long *              next_dial; /* ranks above own only */
   long *              backoff;
@@ -206,6 +207,7 @@ conn_ready( vseq_mesh_t * mesh,
     mesh->backoff[ c->rank ] = BACKOFF_MIN_NS;
   }
   c->state = CONN_READY;
+  mesh->conn_gen[ c->rank ]++;
   FD_LOG_NOTICE(( "connected to peer %lu", c->rank ));
 }
 
@@ -322,8 +324,9 @@ vseq_mesh_create( vseq_mesh_peer_t const * peers,
   mesh->by_rank   = calloc( peer_cnt, sizeof(conn_t *) );
   mesh->next_dial = calloc( peer_cnt, sizeof(long) );
   mesh->backoff   = calloc( peer_cnt, sizeof(long) );
+  mesh->conn_gen  = calloc( peer_cnt, sizeof(ulong) );
   mesh->active    = malloc( peer_cnt );
-  FD_TEST( mesh->peers && mesh->by_rank && mesh->next_dial && mesh->backoff && mesh->active );
+  FD_TEST( mesh->peers && mesh->by_rank && mesh->next_dial && mesh->backoff && mesh->conn_gen && mesh->active );
   memset( mesh->active, 1, peer_cnt );
   memcpy( mesh->peers, peers, peer_cnt*sizeof(vseq_mesh_peer_t) );
   for( ulong r=0UL; r<peer_cnt; r++ ) { mesh->next_dial[r] = now; mesh->backoff[r] = BACKOFF_MIN_NS; }
@@ -390,6 +393,7 @@ vseq_mesh_destroy( vseq_mesh_t * mesh ) {
   if( mesh->lfd>0 ) close( mesh->lfd );
   if( mesh->ep >0 ) close( mesh->ep  );
   free( mesh->backoff );
+  free( mesh->conn_gen );
   free( mesh->next_dial );
   free( mesh->by_rank );
   free( mesh->active );
@@ -496,6 +500,12 @@ int
 vseq_mesh_peer_connected( vseq_mesh_t const * mesh,
                           ulong               rank ) {
   return rank<mesh->peer_cnt && mesh->by_rank[ rank ] && mesh->by_rank[ rank ]->state==CONN_READY;
+}
+
+ulong
+vseq_mesh_peer_conn_gen( vseq_mesh_t const * mesh,
+                         ulong               rank ) {
+  return rank<mesh->peer_cnt ? mesh->conn_gen[ rank ] : 0UL;
 }
 
 vseq_mesh_metrics_t const *
