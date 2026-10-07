@@ -166,6 +166,7 @@ validator that skipped a required upgrade on any chain.
 | Node far behind (more than `--slot-max`) | stops consensus, fetches finalized blocks from peers (`SYNC_REQ`), checks their certs, then rejoins |
 | Node starts with an empty ledger | `--history recent`: start from a peer's latest finalized block, checked by its certs; `--history full`: fetch everything peers keep |
 | Peers pruned the history we need | logged clearly; the node waits (restore segments, or rejoin with an empty ledger) |
+| Peer lies about where its history starts (`--history full`, empty ledger) | its claimed base is only written to the ledger once a batch from it verifies; otherwise the node moves to the next peer |
 | Ledger far older than the vote history (an old copy restored by hand) | refused at startup with the slot that does not fit; restore the matching ledger, or start over with neither file |
 | Validator set change | at the epoch boundary; leavers stay connected one more epoch, joiners connect one epoch early |
 | Peer with a different config | disconnected at the set-hash check, with a log line saying why |

@@ -625,6 +625,8 @@ struct daemon {
     long          deadline;
     long          giveup;
     ag_block_id_t anchor;      /* last block in the ledger */
+    int           has_claim;   /* empty ledger: building on claim, a peer's base, until its blocks prove it */
+    ag_block_id_t claim;
     sync_blk_t    pending[ SYNC_BATCH+1UL ]; /* received, not yet covered by certs */
     ulong         pending_cnt;
     ag_block_id_t pending_last;
@@ -834,7 +836,7 @@ sync_clear_pending( daemon_t * d ) {
 
 static ulong
 sync_after( daemon_t const * d ) {
-  return d->sync.from_tip ? SYNC_TIP : d->sync.anchor.slot;
+  return d->sync.from_tip ? SYNC_TIP : d->sync.has_claim ? d->sync.claim.slot : d->sync.anchor.slot;
 }
 
 /* sync_ask sends SYNC_REQ to the next connected peer (max 0 just asks
@@ -847,7 +849,8 @@ sync_ask( daemon_t * d,
           int        next ) {
   ulong cnt = d->sched->peer_cnt;
   if( next || d->sync.peer==ULONG_MAX ) {
-    d->sync.peer = ULONG_MAX;
+    d->sync.peer      = ULONG_MAX;
+    d->sync.has_claim = 0; /* another peer's blocks will not chain onto this peer's claim */
     for( ulong i=0UL; i<cnt; i++ ) {
       ulong r = ( d->sync.next_peer+i ) % cnt;
       if( r==d->own || !d->hello_ok[r] ) continue;
@@ -874,6 +877,7 @@ sync_start( daemon_t * d ) {
   d->sync.peer        = ULONG_MAX;
   d->sync.giveup      = d->now + SYNC_GIVEUP_NS;
   d->sync.gap_peers   = 0UL;
+  d->sync.has_claim   = 0;
   d->sync.from_tip    = !d->history_full && vseq_ledger_cnt( d->ledger )==vseq_ledger_first_idx( d->ledger );
   if( d->sync.from_tip ) FD_LOG_NOTICE(( "empty ledger: starting from a peer's latest finalized block" ));
   else                   FD_LOG_NOTICE(( "catching up from peers, ledger ends at slot %lu", d->sync.anchor.slot ));
@@ -918,7 +922,10 @@ sync_serve( daemon_t *    d,
    carries certs; once those verify, the queue is appended to the
    ledger.  With an empty ledger and from_tip, the first record (the
    peer's latest finalized block) starts the ledger on its own certs.
-   Anything wrong drops the batch and moves to the next peer. */
+   With an empty ledger and a claim (the peer's base, see sync_end),
+   the first proved batch commits that base to the ledger: the certs
+   cover the batch and, through parent hashes, the base.  Anything
+   wrong drops the batch and moves to the next peer. */
 
 static void
 sync_block( daemon_t *    d,
@@ -942,7 +949,7 @@ sync_block( daemon_t *    d,
     return;
   }
 
-  ag_block_id_t prev = d->sync.pending_cnt ? d->sync.pending_last : d->sync.anchor;
+  ag_block_id_t prev = d->sync.pending_cnt ? d->sync.pending_last : d->sync.has_claim ? d->sync.claim : d->sync.anchor;
   if( FD_UNLIKELY( !ag_block_id_eq( &rec.block.parent, &prev ) ) ) goto bad;
   sync_blk_t * p = &d->sync.pending[ d->sync.pending_cnt++ ];
   p->rec = malloc( sz );
@@ -952,6 +959,11 @@ sync_block( daemon_t *    d,
   d->sync.pending_last = ag_block_id( rec.block.slot, hash );
   if( !proved ) return;
 
+  if( d->sync.has_claim ) {
+    if( FD_UNLIKELY( vseq_ledger_set_base( d->ledger, &d->sync.claim ) ) ) goto bad;
+    FD_LOG_NOTICE(( "starting the ledger after slot %lu, peer %lu's oldest kept block, proved by the certs of slot %lu", d->sync.claim.slot, d->sync.peer, rec.block.slot ));
+    d->sync.has_claim = 0;
+  }
   for( ulong i=0UL; i<d->sync.pending_cnt; i++ ) {
     FD_TEST( !vseq_ledger_rec_parse( d->sync.pending[i].rec, d->sync.pending[i].sz, &rec ) );
     vseq_ledger_append( d->ledger, &rec.block, rec.hash, rec.proof, rec.proof_sz );
@@ -984,14 +996,18 @@ sync_end( daemon_t *    d,
     sync_clear_pending( d ); /* blocks after the last certified one */
     if( d->sync.anchor.slot<base.slot ) {
       int empty = vseq_ledger_cnt( d->ledger )==vseq_ledger_first_idx( d->ledger );
-      if( empty && !vseq_ledger_set_base( d->ledger, &base ) ) {
-        /* Nothing to lose: start after the peer's oldest kept block.
-           The certs at the end of each batch prove what follows. */
-        FD_LOG_NOTICE(( "peer %lu pruned history before slot %lu; starting the ledger there", d->sync.peer, base.slot ));
-        d->sync.anchor = base;
+      if( empty && !( d->sync.has_claim && ag_block_id_eq( &d->sync.claim, &base ) ) ) {
+        /* Nothing to lose: build on the peer's oldest kept block.  The
+           base is only written to the ledger once a batch from this
+           peer proves it (sync_block), so a false claim costs nothing
+           but this peer's turn. */
+        FD_LOG_NOTICE(( "peer %lu pruned history before slot %lu; building on it until its blocks prove it", d->sync.peer, base.slot ));
+        d->sync.has_claim = 1;
+        d->sync.claim     = base;
         sync_ask( d, sync_after( d ), SYNC_BATCH, 0 );
         return;
       }
+      if( empty ) { sync_ask( d, sync_after( d ), SYNC_BATCH, 1 ); return; } /* its batch did not prove its claim: another peer */
       d->sync.gap_peers++;
       if( d->sync.gap_peers>=vseq_mesh_connected_cnt( d->mesh ) && d->now>=d->sync.gap_log ) {
         FD_LOG_WARNING(( "history gap: the ledger ends at slot %lu but every connected peer pruned history before it (peer %lu keeps from slot %lu). "
