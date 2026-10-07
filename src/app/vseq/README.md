@@ -4,7 +4,9 @@ vseq orders opaque transactions with Firedancer's Alpenglow consensus
 (votor) and never executes them. Applications submit txs, read the
 finalized blocks, verify them against the validators' BLS certificates,
 and execute them themselves. Ordering is the network's job; execution is
-the application's.
+the application's. It is the consensus-as-a-service model of
+[Zellular](https://docs.zellular.xyz/), with Alpenglow as the consensus
+engine.
 
 It reuses `src/choreo/votor` unchanged (vote pool, certificates,
 finality, timeouts) and replaces everything Solana-specific around it
@@ -48,7 +50,8 @@ No upstream Firedancer file is modified.
 | `docker` | Local cluster in Docker |
 
 The full config, file and API reference is the comment at the top of
-`vseqd.c`.
+`vseqd.c`. For the design, the safety arguments and the decisions behind
+them, see [DESIGN.md](DESIGN.md).
 
 ## Quick start
 
