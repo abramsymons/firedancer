@@ -204,7 +204,11 @@ verifiable block; pruning deletes whole sealed segments, oldest first.
 
 **`GET /blocks`**: a 20-byte header (`VSQB`, version, the server's
 finalized slot, record count), then ledger records exactly as stored.
-The last record always carries a proof.
+The last record carries a proof unless the size limit cut the reply
+before any record with one; a reader then keeps the records aside,
+fetches on from the last, and trusts them only when a later reply ends
+with a proof (the SDK and node sync both do this). Blocks without a
+proof of their own are those finalized only through a descendant.
 
 **Vote history** (`vseq_history.h`): checksummed records (VOTE, BLOCK,
 FLOOR), compacted to those above the finalized root.

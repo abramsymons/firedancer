@@ -698,17 +698,19 @@ vseq_ledger_read_span( vseq_ledger_t * l,
      Never exceed out_max: fall back to the last record with certs. */
   ulong i0    = first-s->first_idx;
   ulong start = rec_off( s, i0 );
-  ulong cnt = 0UL, proved_end = start, proved_cnt = 0UL;
+  ulong cnt = 0UL, proved_end = start, proved_cnt = 0UL, fit_end = start;
   for( ulong i=i0; i<s->cnt; i++ ) {
     ulong end = rec_end( s, i );
     if( end-start>out_max ) break;
     cnt++;
+    fit_end = end;
     if( s->off[i] & PROVED ) {
       proved_end = end;
       proved_cnt = cnt;
       if( cnt>=cnt_min || end-start>=sz_min ) break;
     }
   }
+  if( !proved_cnt ) { proved_end = fit_end; proved_cnt = cnt; } /* no certs within out_max: the reader fetches on */
   if( !proved_cnt ) return 0UL;
 
   ulong sz = proved_end-start;

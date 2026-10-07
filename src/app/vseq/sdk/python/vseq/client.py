@@ -8,8 +8,11 @@ Nothing a node returns is trusted.  Every block read is checked:
 
   * its hash is recomputed from the slot, parent and txs
   * it links to the previous block by parent hash
-  * the last block of every response carries BLS certificates that
-    finalize it, signed by enough stake of the validator set
+  * the last block of a response carries BLS certificates that
+    finalize it, signed by enough stake of the validator set; when a
+    response was cut short of one (its last blocks were finalized only
+    through a later block), the client holds them back and reads on
+    until a response ends with certificates, which cover them
 
 The certificate and leader schedule checks run in libvseq_client.so,
 which is built from the same Firedancer code as the nodes.
@@ -220,11 +223,13 @@ class Vseq:
     get_last_finalized  the latest verified finalized block
     """
 
-    def __init__(self, network, api_key=None, lib_path=None, timeout=5.0, windows=3):
+    def __init__(self, network, api_key=None, lib_path=None, timeout=5.0, windows=3,
+                 pending_max=64 << 20):
         self.network = network
         self.api_key = api_key
         self.timeout = timeout
         self.windows = windows
+        self.pending_max = pending_max  # bytes of blocks held back while waiting for certs
         self._lib = _Lib(lib_path or _find_lib(), network)
         self.bad_nodes = {}  # api URL -> last verification error
 
@@ -328,12 +333,14 @@ class Vseq:
 
     # Reading -----------------------------------------------------------
 
-    def verify_blocks(self, anchor, raw_blocks):
+    def verify_blocks(self, anchor, raw_blocks, require_proof=True):
         """Check RawBlocks from /blocks that follow the verified block anchor.
 
         Returns them as Blocks, or raises VerificationError.  The last
         block must carry certs; earlier ones are covered through parent
-        hashes.
+        hashes.  With require_proof=False a last block without certs is
+        accepted as chained only: the caller must not trust the blocks
+        until a later block with certs extends them (see _fetch).
         """
         blocks, prev = [], anchor
         for r in raw_blocks:
@@ -344,19 +351,44 @@ class Vseq:
             prev = Block(slot=r.slot, hash=r.hash, parent_slot=r.parent_slot, parent_hash=r.parent_hash,
                          txs=payload_txs(r.payload))
             blocks.append(prev)
-        if raw_blocks:
+        if raw_blocks and (require_proof or raw_blocks[-1].proof):
             last = raw_blocks[-1]
             err = self._lib.verify(last.slot, last.hash, last.proof)
             if err:
                 raise VerificationError(f"slot {last.slot}: {_ERRORS.get(err, err)}")
         return blocks
 
+    def _fetch_proved(self, api, anchor, limit):
+        """Blocks after anchor from one node, up to a block with certs.
+
+        A reply cut short of a block with certs is held back and the
+        node is asked on from its last block; everything held is
+        returned once a reply ends with certs, which cover it through
+        the parent hashes.  A node whose replies never reach certs
+        within pending_max bytes is treated as lying.
+        """
+        pending, prev, size = [], anchor, 0
+        while True:
+            raw = self._get_blocks(api, prev.slot, limit)[1]
+            if not raw:
+                if pending:
+                    raise VerificationError(f"slot {prev.slot}: no certs and nothing follows")
+                return []
+            blocks = self.verify_blocks(prev, raw, require_proof=False)
+            if raw[-1].proof:
+                return pending + blocks
+            pending += blocks
+            prev = blocks[-1]
+            size += sum(len(r.payload) for r in raw)
+            if size > self.pending_max:
+                raise VerificationError(f"{size} bytes of blocks after slot {anchor.slot} without certs")
+
     def _fetch(self, anchor, limit=64):
         """Verified blocks after anchor from any node; [] if none are newer."""
         errors = []
         for api in self._nodes("blocks"):
             try:
-                blocks = self.verify_blocks(anchor, self._get_blocks(api, anchor.slot, limit)[1])
+                blocks = self._fetch_proved(api, anchor, limit)
                 self.bad_nodes.pop(api, None)
                 return blocks
             except VerificationError as e:

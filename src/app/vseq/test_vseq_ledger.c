@@ -59,7 +59,8 @@ check_all( vseq_ledger_t * l ) {
 }
 
 /* Every span is a contiguous run of records ending with one that has
-   certs. */
+   certs, unless no record with certs fits the buffer: then it is what
+   fits, and a span from the record after it carries on. */
 
 static void
 check_spans( vseq_ledger_t * l ) {
@@ -67,7 +68,7 @@ check_spans( vseq_ledger_t * l ) {
   ulong first = vseq_ledger_first_idx( l ), cnt = vseq_ledger_cnt( l );
   for( ulong i=first; i<cnt; i++ ) {
     ulong n, sz = vseq_ledger_read_span( l, i, 1UL, 0UL, buf, sizeof(buf), &n );
-    if( !n ) { FD_TEST( !sz ); continue; } /* trailing records not yet followed by certs */
+    FD_TEST( n ); /* the ledger always ends with certs, so something always qualifies */
     ulong off = 0UL, proof_sz = 0UL;
     for( ulong k=0UL; k<n; k++ ) {
       ulong rec_sz = FD_LOAD( uint, buf+off );
@@ -76,7 +77,21 @@ check_spans( vseq_ledger_t * l ) {
       proof_sz = FD_LOAD( uint, buf+off+152UL+payload_sz );
       off += 4UL+rec_sz;
     }
-    FD_TEST( off==sz && proof_sz );
+    FD_TEST( off==sz );
+    if( !proof_sz ) { /* only the active segment's tail, written after its last certs */
+      FD_TEST( i+n==cnt );
+      for( ulong k=i; k<cnt; k++ ) FD_TEST( k%3UL!=2UL );
+    }
+
+    /* A buffer too small for the next record with certs still yields
+       the records that fit, ending without certs */
+    ulong m, small = vseq_ledger_read_span( l, i, 1UL, 0UL, buf, sz-1UL, &m );
+    FD_TEST( m<n && small<sz );
+    if( m ) {
+      ulong o = 0UL;
+      for( ulong k=0UL; k<m; k++ ) { FD_TEST( FD_LOAD( ulong, buf+o+4UL )==chain[ i+k ].slot ); o += 4UL+FD_LOAD( uint, buf+o ); }
+      FD_TEST( o==small );
+    }
   }
 }
 

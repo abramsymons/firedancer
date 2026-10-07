@@ -29,7 +29,7 @@
    size limit, the next record with its own certs seals it: the segment
    is fsynced, its index is written to a temporary file, fsynced and
    renamed, and the directory is fsynced.  So every sealed segment ends
-   with a block a client can verify, and a /blocks span never needs to
+   with a block a client can verify, and a /blocks span rarely needs to
    cross segments.
 
    Opening loads sealed segments' indexes (rebuilding a missing or bad
@@ -168,9 +168,13 @@ vseq_ledger_read( vseq_ledger_t *     ledger,
 /* vseq_ledger_read_span copies records starting at index first, as
    they are on disk, into out.  It takes at least cnt_min records or
    sz_min bytes, then continues to the next record with its own certs,
-   so the span always ends with a record a client can verify.  It stays
-   within one segment and never exceeds out_max.  Returns the byte size
-   and sets *out_cnt (0 if nothing qualifies). */
+   so the span normally ends with a record a client can verify.  It
+   stays within one segment and never exceeds out_max: if no record with
+   certs fits, it returns the records that do, and the reader must fetch
+   on from the last one before trusting any of them (a segment always
+   ends with certs, so a later span will).  Returns the byte size and
+   sets *out_cnt (0 only if first is past the end or the first record
+   alone exceeds out_max). */
 
 ulong
 vseq_ledger_read_span( vseq_ledger_t * ledger,

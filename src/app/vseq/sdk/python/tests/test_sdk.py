@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import dataclasses
+import functools
 import copy
 import http.server
 import os
@@ -72,11 +73,17 @@ def expect_reject(fn, needle):
 
 
 class LyingProxy(http.server.ThreadingHTTPServer):
-    """Forwards to a real node but replaces the first tx of every block in /blocks."""
+    """Forwards to a real node but replaces the first tx of every block in /blocks.
 
-    def __init__(self, upstream):
+    With cut=True it instead strips the certs from the last block of
+    every other /blocks reply, as a reply cut by the size limit looks."""
+
+    def __init__(self, upstream, cut=False):
         self.upstream = upstream
         self.lies = 0
+        self.cut = cut
+        self.cuts = 0
+        self.replies = 0
         super().__init__(("127.0.0.1", 0), LyingHandler)
 
 
@@ -94,10 +101,17 @@ class LyingHandler(http.server.BaseHTTPRequestHandler):
             code, data = e.code, e.read()
         if self.path.startswith("/blocks?") and code == 200:
             finalized, blocks = decode_blocks(data)
-            for i, b in enumerate(blocks):
-                if payload_txs(b.payload):
-                    blocks[i] = with_first_tx(b, b"evil")
-                    self.server.lies += 1
+            self.server.replies += 1
+            if self.server.cut:
+                # never cut the tip: a real reply ending at the tip always has certs
+                if blocks and self.server.replies % 2 and blocks[-1].proof and blocks[-1].slot < finalized:
+                    blocks[-1] = dataclasses.replace(blocks[-1], proof=b"")
+                    self.server.cuts += 1
+            else:
+                for i, b in enumerate(blocks):
+                    if payload_txs(b.payload):
+                        blocks[i] = with_first_tx(b, b"evil")
+                        self.server.lies += 1
             data = encode_blocks(finalized, blocks)
         self.send_response(code)
         self.send_header("Content-Type", "application/octet-stream")
@@ -292,6 +306,28 @@ def main():
             assert proxy.lies > 0
             print(f"        read {got} verified blocks; liar flagged: {liar.bad_nodes[vals[0].blocks]}")
         check("skips a lying node and keeps reading", lying_node)
+
+        def cut_replies():
+            proxy = LyingProxy(net.validators[0].blocks, cut=True)
+            threading.Thread(target=proxy.serve_forever, daemon=True).start()
+            vals = list(net.validators)
+            vals[0] = type(vals[0])(stake=vals[0].stake, identity=vals[0].identity, bls=vals[0].bls,
+                                     api=vals[0].api, blocks=f"http://127.0.0.1:{proxy.server_address[1]}")
+            reader = Vseq(Network(net.network_id, vals, net.epoch_slots), api_key=key, lib_path=args.lib)
+            reader._nodes = lambda kind="api": [getattr(v, kind) for v in vals[:1]]  # only the cutting proxy
+            reader._fetch = functools.partial(Vseq._fetch, reader, limit=4)          # several replies per read
+            want = [(b.slot, b.hash) for b in vs.batches(deadline=time.time() + 5)]
+            got = []
+            for blk in reader.batches(deadline=time.time() + 15):
+                got.append((blk.slot, blk.hash))
+                if blk.slot >= want[-1][0]:
+                    break
+            proxy.shutdown()
+            assert proxy.cuts > 0, "no reply was cut"
+            assert got[:len(want)] == want, "blocks read through cut replies differ"
+            assert vals[0].blocks not in reader.bad_nodes, reader.bad_nodes
+            print(f"        read {len(got)} verified blocks through {proxy.cuts} replies cut before their certs")
+        check("reads on past replies cut before their certs", cut_replies)
 
     finally:
         for p in procs:

@@ -154,9 +154,12 @@
      ulong finalized     the node's finalized slot
      uint  count         records that follow
 
-   The last record always has its own certs, so a client can verify
-   everything it got: check the certs on the last block, then follow
-   parent hashes back. */
+   The last record has its own certs unless the size limit cut the
+   reply before any block with certs (rare: blocks finalized only
+   through a descendant).  A client checks the certs on the last block
+   and follows parent hashes back; without them it must keep the blocks
+   aside, fetch on from the last one, and trust them only once a later
+   reply ends with certs. */
 
 #define _GNU_SOURCE
 #include "vseq_node.h"
@@ -195,6 +198,7 @@
 #define STATUS_LOG_NS   (10L*1000L*1000L*1000L)
 #define SEC_NS          (1000L*1000L*1000L)
 #define SYNC_BATCH      (32UL)        /* blocks per sync request */
+#define SYNC_PENDING_MAX (64UL<<20)   /* bytes of synced blocks held until a cert covers them */
 #define SYNC_TIP        (ULONG_MAX)   /* SYNC_REQ after_slot asking for the peer's latest finalized block */
 #define SYNC_NEAR       (16UL)        /* close enough to the peer's tip to start consensus */
 #define SYNC_TIMEOUT_NS (3L*SEC_NS)   /* ask the next peer */
@@ -627,8 +631,10 @@ struct daemon {
     ag_block_id_t anchor;      /* last block in the ledger */
     int           has_claim;   /* empty ledger: building on claim, a peer's base, until its blocks prove it */
     ag_block_id_t claim;
-    sync_blk_t    pending[ SYNC_BATCH+1UL ]; /* received, not yet covered by certs */
+    sync_blk_t *  pending;     /* received, not yet covered by certs */
     ulong         pending_cnt;
+    ulong         pending_max;
+    ulong         pending_sz;  /* bytes */
     ag_block_id_t pending_last;
     ulong         blocks;      /* appended by sync, total */
     ulong         gap_peers;   /* peers this round that pruned past our ledger */
@@ -831,13 +837,17 @@ static void
 sync_clear_pending( daemon_t * d ) {
   for( ulong i=0UL; i<d->sync.pending_cnt; i++ ) free( d->sync.pending[i].rec );
   d->sync.pending_cnt = 0UL;
+  d->sync.pending_sz  = 0UL;
 }
 
-/* sync_after is what to ask peers for next. */
+/* sync_after is what to ask peers for next: after the last block we
+   hold without certs yet, else after the claim or the ledger tip. */
 
 static ulong
 sync_after( daemon_t const * d ) {
-  return d->sync.from_tip ? SYNC_TIP : d->sync.has_claim ? d->sync.claim.slot : d->sync.anchor.slot;
+  if( d->sync.from_tip    ) return SYNC_TIP;
+  if( d->sync.pending_cnt ) return d->sync.pending_last.slot;
+  return d->sync.has_claim ? d->sync.claim.slot : d->sync.anchor.slot;
 }
 
 /* sync_ask sends SYNC_REQ to the next connected peer (max 0 just asks
@@ -921,8 +931,11 @@ sync_serve( daemon_t *    d,
 
 /* sync_block checks one record from the peer.  Records queue until one
    carries certs; once those verify, the queue is appended to the
-   ledger.  With an empty ledger and from_tip, the first record (the
-   peer's latest finalized block) starts the ledger on its own certs.
+   ledger.  The queue outlives a batch: a batch cut by size may end
+   without certs, and the next one is asked from its last record
+   (sync_after).  With an empty ledger and from_tip, the first record
+   (the peer's latest finalized block) starts the ledger on its own
+   certs.
    With an empty ledger and a claim (the peer's base, see sync_end),
    the first proved batch commits that base to the ledger: the certs
    cover the batch and, through parent hashes, the base.  Anything
@@ -934,7 +947,11 @@ sync_block( daemon_t *    d,
             ulong         sz ) {
   vseq_ledger_rec_t rec;
   ag_block_hash_t   hash;
-  if( FD_UNLIKELY( vseq_ledger_rec_parse( rec_buf, sz, &rec ) || d->sync.pending_cnt>SYNC_BATCH ) ) goto bad;
+  if( FD_UNLIKELY( vseq_ledger_rec_parse( rec_buf, sz, &rec ) ) ) goto bad;
+  if( FD_UNLIKELY( d->sync.pending_cnt==d->sync.pending_max || d->sync.pending_sz+sz>SYNC_PENDING_MAX ) ) {
+    FD_LOG_WARNING(( "sync: peer %lu sent %lu blocks (%lu bytes) after slot %lu without any certs; asking another peer", d->sync.peer, d->sync.pending_cnt, d->sync.pending_sz, d->sync.anchor.slot ));
+    goto bad;
+  }
   vseq_block_hash( rec.block.slot, &rec.block.parent, rec.block.payload, rec.block.payload_sz, hash );
   if( FD_UNLIKELY( memcmp( hash, rec.hash, sizeof(ag_block_hash_t) ) ) ) goto bad;
   int proved = rec.proof_sz && !vseq_proof_verify( vseq_sched_set( d->sched, rec.block.slot )->epoch, d->cluster->network_id, rec.block.slot, hash, rec.proof, rec.proof_sz, d->cert );
@@ -957,6 +974,7 @@ sync_block( daemon_t *    d,
   p->sz  = sz;
   FD_TEST( p->rec );
   memcpy( p->rec, rec_buf, sz );
+  d->sync.pending_sz  += sz;
   d->sync.pending_last = ag_block_id( rec.block.slot, hash );
   if( !proved ) return;
 
@@ -1022,7 +1040,13 @@ sync_end( daemon_t *    d,
   ulong         tip  = FD_LOAD( ulong, body );
   ag_block_id_t base = ag_block_id( FD_LOAD( ulong, body+8UL ), body+16UL );
   if( d->sync.active ) {
-    sync_clear_pending( d ); /* blocks after the last certified one */
+    if( d->sync.pending_cnt ) {
+      /* The batch was cut before a block with certs; its ledger always
+         ends with one, so there is more.  Nothing more means it lied. */
+      if( tip>d->sync.pending_last.slot ) sync_ask( d, sync_after( d ), SYNC_BATCH, 0 );
+      else                                sync_ask( d, sync_after( d ), SYNC_BATCH, 1 );
+      return;
+    }
     if( d->sync.anchor.slot<base.slot ) {
       int empty = vseq_ledger_cnt( d->ledger )==vseq_ledger_first_idx( d->ledger );
       if( empty && !( d->sync.has_claim && ag_block_id_eq( &d->sync.claim, &base ) ) ) {
@@ -1274,7 +1298,9 @@ cmd_run( int     argc,
   d.span    = malloc( SPAN_MAX );
   d.cert    = aligned_alloc( alignof(ag_cert_t), fd_ulong_align_up( sizeof(ag_cert_t), alignof(ag_cert_t) ) );
   d.sync.peer = ULONG_MAX;
-  FD_TEST( d.msg && d.cert && d.span );
+  d.sync.pending_max = SYNC_PENDING_MAX/( VSEQ_LEDGER_REC_SZ( 0UL, 0UL ) ) + 1UL; /* enough for SYNC_PENDING_MAX bytes of the smallest records */
+  d.sync.pending     = malloc( d.sync.pending_max*sizeof(sync_blk_t) );
+  FD_TEST( d.msg && d.cert && d.span && d.sync.pending );
 
   d.retain_slots = retain_slots;
   d.history_full = !strcmp( history, "full" );
