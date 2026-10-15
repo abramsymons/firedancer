@@ -272,7 +272,7 @@ key_derive_pub( node_key_t * k ) {
   fd_ed25519_public_from_private( k->id_pub, k->id_sec, sha );
   fd_bls_pub_t pub;
   fd_bls_sec_to_pub( &k->bls_sec, &pub );
-  blst_p1_compress( k->bls_pub, &pub );
+  blst_p1_affine_compress( k->bls_pub, &pub );
 }
 
 static void

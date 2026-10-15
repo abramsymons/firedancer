@@ -530,7 +530,7 @@ run( scenario_t const * sc,
     uchar ikm[ 32 ] = {0}; FD_STORE( ulong, ikm, 0xb15UL+i );
     fd_bls_sec_derive( &bls_sec[i], ikm, sizeof(ikm) );
     fd_bls_pub_t pub; fd_bls_sec_to_pub( &bls_sec[i], &pub );
-    blst_p1_compress( members[i].v.bls_key, &pub );
+    blst_p1_affine_compress( members[i].v.bls_key, &pub );
     for( ulong j=0UL; j<32UL; j++ ) id_sec[i][j] = fd_rng_uchar( sim->rng );
     fd_ed25519_public_from_private( members[i].v.id_key, id_sec[i], sha );
     members[i].v.stake     = sc->stake[i] ? sc->stake[i] : 1UL;

@@ -124,5 +124,5 @@ A prototype, not production ready. Known gaps:
   validators, not hundreds (Firedancer's rotor would fix that).
 - No long adversarial runs yet.
 - No wire protocol versioning or metrics export yet.
-- Each node needs about 0.75 GB of memory (votor reserves room for 2,000
+- Each node needs about 170 MB of memory (votor reserves room for 2,000
   validators in each of 64 tracked slots, `--slot-max`).

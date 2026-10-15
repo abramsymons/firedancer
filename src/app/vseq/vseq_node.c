@@ -30,6 +30,9 @@ FD_STATIC_ASSERT( BLKS_PER_SLOT_MAX<BLKS_PER_SLOT_WANTED, per_slot_cap );
 #define REPAIR_BODY_SZ     (sizeof(ulong)+sizeof(ag_block_hash_t))
 #define BODY_MAX           (AG_VOTE_SER_MAX>AG_CERT_SER_MAX ? AG_VOTE_SER_MAX : AG_CERT_SER_MAX)
 #define MSG_MAX            (1UL+BODY_MAX)
+/* The pool's event queues hold what up to POOL_BURST adds push, so
+   drain_pool runs after every add (see ag_pool.c) */
+#define POOL_BURST         (1UL)
 
 /* Block store ********************************************************/
 
@@ -122,6 +125,8 @@ struct __attribute__((aligned(FD_SHA512_ALIGN))) vseq_node {
     ag_pool_event_t    pool_event;
     ag_block_id_t      block_id;
   } scratch;
+  ag_pool_event_t         drain_event;    /* drain_pool's own: it runs while scratch holds a vote or cert */
+  ag_block_id_t           drain_block_id;
 
   vseq_node_metrics_t     metrics;
 };
@@ -302,10 +307,13 @@ note_block( vseq_node_t * node,
    either, since its slot table is bounded the same way, and the caller
    retries once the root has advanced. */
 
+static void drain_pool( vseq_node_t * node );
+
 static int
 replay( vseq_node_t * node,
         blk_t const * blk ) {
   int err = ag_pool_add_block( node->pool, &blk->id, &blk->parent, node->bad );
+  drain_pool( node );
   ban_bad_ranks( node, blk->id.slot, node->bad );
   if( FD_UNLIKELY( err ) ) return err;
 
@@ -576,11 +584,14 @@ deliver_finalized( vseq_node_t * node ) {
 
 /* Events *************************************************************/
 
+static void handle_own_cert( vseq_node_t * node, ag_cert_t const * cert );
+
 static void
 handle_pool_event( vseq_node_t *           node,
                    ag_pool_event_t const * event ) {
   if( event->kind==AG_POOL_EVENT_IMPLICITLY_SKIPPED || event->kind==AG_POOL_EVENT_IMPLICITLY_FINALIZED ) return; /* not for votor */
-  ag_votor_handle_pool_event( node->votor, event, node->now );
+  ag_cert_t const * broadcast = ag_votor_handle_pool_event( node->votor, event, node->now );
+  if( broadcast ) handle_own_cert( node, broadcast );
   switch( event->kind ) {
   case AG_POOL_EVENT_PARENT_READY:
     node->highest_parent_ready_slot = fd_ulong_max( node->highest_parent_ready_slot, event->parent_ready.slot );
@@ -614,6 +625,7 @@ handle_own_vote( vseq_node_t *     node,
     char cstr[ AG_VOTE_CSTR_MAX ];
     FD_LOG_INFO(( "withholding %s: %s", ag_vote_to_cstr( vote, cstr ), ag_pool_strerror( err ) ));
     node->metrics.votes_withheld++;
+    drain_pool( node );
     return;
   }
 
@@ -630,18 +642,30 @@ handle_own_vote( vseq_node_t *     node,
                             blk ? blk->wire+1UL : NULL, blk ? blk->wire_sz-1UL : 0UL );
   }
   send_msg( node, VSEQ_DST_ALL, node->msg, sz );
+  drain_pool( node ); /* only now: a cert our vote completes carries our signature */
 }
+
+/* handle_own_cert sends a cert our pool created (it holds it already). */
 
 static void
 handle_own_cert( vseq_node_t *     node,
                  ag_cert_t const * cert ) {
-  if( FD_UNLIKELY( ag_cert_slot( cert )<=node->root.slot ) ) return; /* root certs, rebroadcast by standstill recovery: peers have them */
-  ag_pool_add_cert( node->pool, cert, node->bad );
-  ban_bad_ranks( node, ag_cert_slot( cert ), node->bad );
-
+  if( FD_UNLIKELY( ag_cert_slot( cert )<=node->root.slot ) ) return; /* root certs: peers have them */
   node->msg[0] = VSEQ_MSG_CERT;
   ulong sz = 1UL + ag_cert_ser( cert, node->msg+1UL );
   send_msg( node, VSEQ_DST_ALL, node->msg, sz );
+}
+
+/* drain_pool hands the pool's events to votor and sends its repair
+   requests.  It runs after every pool add, as the pool's queues only
+   hold what POOL_BURST adds push.  Votor's own votes wait for
+   vseq_node_service, so they are checked against every vote restored
+   at creation. */
+
+static void
+drain_pool( vseq_node_t * node ) {
+  while( ag_pool_poll_pool_event( node->pool, &node->drain_event ) ) handle_pool_event( node, &node->drain_event );
+  while( ag_pool_poll_repair_event( node->pool, &node->drain_block_id ) ) repair_request( node, &node->drain_block_id );
 }
 
 static void
@@ -687,9 +711,9 @@ vseq_node_create( vseq_node_cfg_t const * cfg,
   }
   fd_bls_pub_t bls_pub;
   fd_bls_sec_to_pub( &cfg->bls_sec, &bls_pub );
-  blst_p1_compress( node->bls_pub, &bls_pub );
+  blst_p1_affine_compress( node->bls_pub, &bls_pub );
 
-  node->pool_mem  = alloc_aligned( ag_pool_align(),  ag_pool_footprint ( cfg->slot_max ) );
+  node->pool_mem  = alloc_aligned( ag_pool_align(),  ag_pool_footprint ( cfg->slot_max, POOL_BURST ) );
   node->votor_mem = alloc_aligned( ag_votor_align(), ag_votor_footprint( cfg->slot_max ) );
   node->blk_max   = cfg->slot_max*BLKS_PER_SLOT_WANTED + cfg->retain_slots;
   ulong chain_cnt = blk_map_chain_cnt_est( node->blk_max );
@@ -701,7 +725,7 @@ vseq_node_create( vseq_node_cfg_t const * cfg,
   node->banned_until = calloc( node->sched->peer_cnt, sizeof(long) );
   FD_TEST( node->pool_mem && node->votor_mem && node->blk_pool_mem && node->blk_map_mem && node->blk_scratch && node->txq && node->build_buf && node->banned_until );
 
-  node->pool    = ag_pool_join ( ag_pool_new ( node->pool_mem,  cfg->slot_max, cfg->seed ) );
+  node->pool    = ag_pool_join ( ag_pool_new ( node->pool_mem,  cfg->slot_max, POOL_BURST, cfg->seed ) );
   node->votor   = ag_votor_join( ag_votor_new( node->votor_mem, cfg->slot_max, cfg->seed ) );
   node->blks    = blk_pool_join( blk_pool_new( node->blk_pool_mem, node->blk_max ) );
   node->blk_map = blk_map_join ( blk_map_new ( node->blk_map_mem, chain_cnt, cfg->seed ) );
@@ -732,7 +756,8 @@ vseq_node_create( vseq_node_cfg_t const * cfg,
     for( ulong off=0UL; off<cfg->root_proof_sz; ) {
       ulong sz = FD_LOAD( uint, cfg->root_proof+off ), bit_cnt;
       FD_TEST( !ag_cert_de( cert, &bit_cnt, cfg->root_proof+off+sizeof(uint), sz ) );
-      FD_TEST( !ag_pool_add_verified_cert( node->pool, cert, node->bad ) );
+      FD_TEST( !ag_pool_add_cert( node->pool, cert, 1, node->bad ) );
+      drain_pool( node );
       off += sizeof(uint)+sz;
     }
   }
@@ -791,6 +816,7 @@ vseq_node_create( vseq_node_cfg_t const * cfg,
     set_vote_rank( vote, (ushort)rank );
     uchar quorum_reached;
     int   err = ag_pool_add_vote( node->pool, vote, node->bad, &quorum_reached );
+    drain_pool( node );
     if( FD_UNLIKELY( err==AG_POOL_ERR_DUPLICATE ) ) continue;
     if( FD_UNLIKELY( err ) ) {
       char cstr[ AG_VOTE_CSTR_MAX ];
@@ -850,7 +876,7 @@ recv_vote( vseq_node_t * node,
   set_vote_rank( vote, (ushort)rank );
 
   if( FD_UNLIKELY( ag_vote_shred_version( vote )!=node->cfg.network_id ) ) return;
-  if( FD_UNLIKELY( blst_p2_is_inf( ag_vote_sig( vote ) ) ) ) { ban_peer( node, from ); return; } /* never a valid signature */
+  if( FD_UNLIKELY( blst_p2_affine_is_inf( ag_vote_sig( vote ) ) ) ) { ban_peer( node, from ); return; } /* never a valid signature */
   uchar const * block_hash = ag_vote_block_hash( vote );
   if( FD_UNLIKELY( block_hash && !memcmp( block_hash, ag_block_hash_null, sizeof(ag_block_hash_t) ) ) ) return;
   ulong finalized = ag_pool_finalized_slot( node->pool );
@@ -879,6 +905,7 @@ recv_vote( vseq_node_t * node,
 
   uchar quorum_reached;
   ag_pool_add_vote( node->pool, vote, node->bad, &quorum_reached );
+  drain_pool( node );
   ban_bad_ranks( node, ag_vote_slot( vote ), node->bad );
 }
 
@@ -894,7 +921,9 @@ recv_cert( vseq_node_t * node,
   if( FD_UNLIKELY( ag_cert_shred_version( cert )!=node->cfg.network_id || bit_cnt>set_of( node, slot )->epoch->validator_cnt ) ) return;
   if( FD_UNLIKELY( slot<=ag_pool_finalized_slot( node->pool ) ) ) return; /* as for votes */
 
-  if( FD_UNLIKELY( ag_pool_add_cert( node->pool, cert, node->bad )==AG_POOL_ERR_CERT_VERIFY ) ) ban_peer( node, from );
+  int err = ag_pool_add_cert( node->pool, cert, 0, node->bad );
+  drain_pool( node );
+  if( FD_UNLIKELY( err==AG_POOL_ERR_CERT_VERIFY ) ) ban_peer( node, from );
   ban_bad_ranks( node, slot, node->bad );
 }
 
@@ -942,7 +971,12 @@ vseq_node_service( vseq_node_t * node,
      AG_DELTA_STANDSTILL_NS until finalization resumes. */
 
   if( FD_UNLIKELY( now-node->last_final_ts>=AG_DELTA_STANDSTILL_NS ) ) {
-    ag_pool_recover_from_standstill( node->pool );
+    ag_pool_standstill_iter_t iter[1];
+    for( ag_pool_standstill_iter_init( iter, node->pool ); !ag_pool_standstill_iter_done( iter ); ag_pool_standstill_iter_next( iter, node->pool ) ) {
+      node->msg[0] = iter->is_vote ? VSEQ_MSG_VOTE : VSEQ_MSG_CERT;
+      ulong sz = 1UL + ( iter->is_vote ? ag_vote_ser( &iter->vote, node->msg+1UL ) : ag_cert_ser( &iter->cert, node->msg+1UL ) );
+      send_msg( node, VSEQ_DST_ALL, node->msg, sz );
+    }
     node->last_final_ts = now;
     node->metrics.standstills++;
   }
@@ -962,10 +996,6 @@ vseq_node_service( vseq_node_t * node,
     uchar reason;
     while( ag_votor_poll_vote( node->votor, &node->scratch.vote, &reason ) ) {
       handle_own_vote( node, &node->scratch.vote );
-      busy = 1;
-    }
-    while( ag_votor_poll_cert( node->votor, &node->scratch.cert ) ) {
-      handle_own_cert( node, &node->scratch.cert );
       busy = 1;
     }
     while( ag_pool_poll_repair_event( node->pool, &node->scratch.block_id ) ) {

@@ -109,7 +109,7 @@ def main():
     ap.add_argument("--segment-kb", type=int, default=0)
     ap.add_argument("--retain-slots", type=int, default=0)
     ap.add_argument("--history", default=None, help="recent or full, passed to every node")
-    ap.add_argument("--slot-max", type=int, default=0, help="passed to every node (memory is ~11.5 MB per slot)")
+    ap.add_argument("--slot-max", type=int, default=0, help="passed to every node (memory is ~2.5 MB per slot)")
     ap.add_argument("--dir", default=None)
     ap.add_argument("--base-port", type=int, default=19000)
     ap.add_argument("--api-base-port", type=int, default=18000)

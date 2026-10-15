@@ -93,7 +93,7 @@ The contract with votor, all in `vseq_node.c`:
   We give it the next set ahead of time, and the one after once the root
   enters the next set, so a set must last at least `--slot-max` slots.
 - **Memory:** votor tracks `--slot-max` slots (64 by default) and
-  reserves room for 2,000 validators in each, about 11.5 MB per slot.
+  reserves room for 2,000 validators in each, about 2.5 MB per slot.
 
 ## 4. Why it is safe
 

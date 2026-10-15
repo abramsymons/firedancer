@@ -148,7 +148,7 @@ LLVMFuzzerInitialize( int  *   argc,
     uchar ikm[ 32 ] = {0}; FD_STORE( ulong, ikm, 0xf022UL+i );
     fd_bls_sec_derive( &bls_sec[i], ikm, sizeof(ikm) );
     fd_bls_pub_t pub; fd_bls_sec_to_pub( &bls_sec[i], &pub );
-    blst_p1_compress( members[i].v.bls_key, &pub );
+    blst_p1_affine_compress( members[i].v.bls_key, &pub );
     memset( id_sec[i], (int)(0x40+i), 32UL );
     fd_ed25519_public_from_private( members[i].v.id_key, id_sec[i], sha );
     members[i].v.stake     = 10UL-i;
