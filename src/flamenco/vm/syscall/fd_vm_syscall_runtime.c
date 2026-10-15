@@ -396,8 +396,9 @@ fd_vm_syscall_sol_get_epoch_stake( /**/            void *  _vm,
   ulong stake = 0UL;
   /* It's okay to ignore if an account is invalid since these stakes
      are calculated from an older snapshot of vote account stakes. */
-  fd_bank_t * bank = vm->instr_ctx->bank;
-  fd_vote_stakes_query_t_1( fd_bank_vote_stakes( bank ), bank->vote_stakes_fork_id, vote_address, NULL, &stake, NULL );
+  fd_bank_t *          bank = vm->instr_ctx->bank;
+  fd_vote_stakes_ele_t ele[1];
+  if( fd_vote_stakes_query_t_1( fd_bank_vote_stakes( bank ), bank->vote_stakes_fork_id, vote_address, ele ) ) stake = ele->stake;
 
   vm->reg[0] = stake;
 
@@ -648,7 +649,9 @@ fd_vm_syscall_sol_get_processed_sibling_instruction(
       fd_memcpy( program_id, instr_ctx_program_id, sizeof(fd_pubkey_t) );
 
       /* https://github.com/anza-xyz/agave/blob/v2.3.1/programs/bpf_loader/src/syscalls/mod.rs#L1563 */
-      fd_memcpy( data, found_instruction_context->data, found_instruction_context->data_sz );
+      if( FD_LIKELY( found_instruction_context->data_sz ) ) {
+        fd_memcpy( data, found_instruction_context->data, found_instruction_context->data_sz );
+      }
 
       /* https://github.com/anza-xyz/agave/blob/v2.3.1/programs/bpf_loader/src/syscalls/mod.rs#L1564-L1581 */
       for( ushort i=0; i<found_instruction_context->acct_cnt; i++ ) {

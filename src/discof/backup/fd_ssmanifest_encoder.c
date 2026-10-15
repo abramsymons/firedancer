@@ -10,22 +10,27 @@ ENCODE_FN {
 
   switch( enc->state ) {
   case STATE_BLOCKHASH_QUEUE: {
-    fd_blockhashes_t const *    bhq = &bank->f.block_hash_queue;
-    fd_blockhash_info_t const * deq = bhq->d.deque;
-    ulong total    = fd_blockhash_deq_cnt( deq );
-    ulong to_write = fd_ulong_min( total, FD_BLOCKHASHES_MAX );
-    ulong to_skip  = total - to_write;
-    PUSH_VAL( ulong, to_write-1UL ); /* last hash index */
-    fd_hash_t const * last_hash = fd_blockhashes_peek_last_hash( bhq );
-    PUSH_VAL( uchar, !!last_hash );
-    if( last_hash ) PUSH_VAL( fd_hash_t, *last_hash );
+    fd_blockhashes_t const *    bhq   = &bank->f.block_hash_queue;
+    fd_blockhash_info_t const * deq   = bhq->d.deque;
+    ulong                       total = fd_blockhash_deq_cnt( deq );
 
-    PUSH_VAL( ulong, to_write );
-    for( ulong i=0UL; i<to_write; i++ ) {
-      fd_blockhash_info_t const * ele = fd_blockhash_deq_peek_index_const( deq, to_skip+i );
+    /* Write the newest FD_BLOCKHASHES_MAX entries by count, each at its
+       own absolute hash_index. with skipped indices it can keep an
+       entry older than max_age. */
+    ulong cnt     = fd_ulong_min( total, FD_BLOCKHASHES_MAX );
+    ulong to_skip = total - cnt;
+
+    fd_blockhash_info_t const * last = fd_blockhashes_peek_last( bhq );
+    PUSH_VAL( ulong, last ? last->hash_index : 0UL ); /* last hash index */
+    PUSH_VAL( uchar, !!last );
+    if( last ) PUSH_VAL( fd_hash_t, last->hash );
+
+    PUSH_VAL( ulong, cnt );
+    for( ulong i=to_skip; i<total; i++ ) {
+      fd_blockhash_info_t const * ele = fd_blockhash_deq_peek_index_const( deq, i );
       PUSH_VAL( fd_hash_t, ele->hash );
       PUSH_VAL( ulong,     ele->lamports_per_signature );
-      PUSH_VAL( ulong,     i );
+      PUSH_VAL( ulong,     ele->hash_index );
       PUSH_VAL( ulong,     0UL ); /* timestamp, ignored */
     }
     PUSH_VAL( ulong, FD_BLOCKHASHES_MAX-1UL ); /* max_age */
@@ -183,62 +188,53 @@ ENCODE_FN {
   case STATE_EPOCH_STAKES_STAKES: {
     int iter_kind = epoch_stakes_iter_kind( bank, enc->epoch_idx );
 
-    fd_pubkey_t pubkey       = {0};
-    ulong       stake        = 0UL;
-    fd_pubkey_t node_account = {0};
-    ushort      commission   = 0;
-    ulong       ec_cnt       = 0UL;
+    ulong       ec_cnt            = 0UL;
     fd_epoch_credits_t const * ec = NULL;
-    uchar bls_key[ FD_BLS_PUB_COMPRESSED_SZ ] = {0};
+    ulong ag_marker_idx           = ULONG_MAX;
 
-    fd_collector_overrides_t * overrides = fd_bank_collector_overrides( bank );
-    ushort co_root = fd_collector_overrides_get_root_idx( overrides );
-    ulong  co_epoch = ULONG_MAX; /* no collector lookup */
     fd_vote_stakes_t * vote_stakes = fd_bank_vote_stakes( bank );
     ulong              fork_id     = bank->vote_stakes_fork_id;
 
     fd_vote_stakes_iter_t * iter = fd_type_pun( enc->vote_stakes_iter_mem );
     FD_TEST( !fd_vote_stakes_iter_done( vote_stakes, fork_id, iter_kind, iter ) );
-    fd_vote_stakes_iter_ele( vote_stakes, fork_id, iter_kind, iter, &pubkey, &node_account, &stake,
-                             NULL, NULL, &commission, NULL, NULL, bls_key, NULL );
-
-    ushort block_revenue_commission_bps = FD_VOTE_DEFAULT_BLOCK_REVENUE_COMMISSION_BPS;
-    ulong  pending_delegator_rewards    = 0UL;
-    fd_vote_stakes_iter_block_revenue( vote_stakes, fork_id, iter_kind, iter,
-                                       &block_revenue_commission_bps, &pending_delegator_rewards );
+    fd_vote_stakes_ele_t ele[1];
+    fd_vote_stakes_iter_ele( vote_stakes, fork_id, iter_kind, iter, ele );
 
     if( iter_kind==FD_VOTE_STAKES_ITER_T_1 ) {
-      ec = find_epoch_credits( enc->bank, &pubkey );
+      ec = find_epoch_credits( enc->bank, &ele->pubkey );
       FD_TEST( ec );
       ec_cnt = ec->cnt;
-      co_epoch = bank->f.epoch;
-    } else if( iter_kind==FD_VOTE_STAKES_ITER_T_2 ) {
-      co_epoch = fd_ulong_sat_sub( bank->f.epoch, 1UL );
+      if( FD_UNLIKELY( ec->has_ag_migration_marker ) ) {
+        ulong ag_migration_slot  = bank->f.alpenglow_migration_slot;
+        FD_TEST( ag_migration_slot!=ULONG_MAX );
+        ulong ag_migration_epoch = fd_slot_to_epoch( &bank->f.epoch_schedule, ag_migration_slot, NULL );
+        ag_marker_idx            = fd_epoch_credits_ag_marker_idx( ec, ag_migration_epoch );
+        ec_cnt++;
+      }
     }
-    /* t-3..t-5 collectors are never consulted on reload; encoded as zero */
 
-    /* SIMD-0232 collectors: defaults unless overridden. */
+    /* SIMD-0232 collectors.  t-3..t-5 collectors are never consulted on
+       reload; encoded as zero. */
     fd_pubkey_t inflation_collector = {0};
     fd_pubkey_t block_collector     = {0};
-    if( FD_LIKELY( co_epoch!=ULONG_MAX ) ) {
-      inflation_collector = pubkey;
-      block_collector     = node_account;
-      fd_collector_overrides_query( overrides, co_root, co_epoch, &pubkey, &inflation_collector, &block_collector );
+    if( FD_LIKELY( iter_kind==FD_VOTE_STAKES_ITER_T_1 || iter_kind==FD_VOTE_STAKES_ITER_T_2 ) ) {
+      inflation_collector = ele->inflation_collector;
+      block_collector     = ele->block_collector;
     }
 
     /* A zeroed key means no BLS key is registered (serialized as None) */
     static uchar const no_bls_key[ FD_BLS_PUB_COMPRESSED_SZ ] = {0};
-    int has_bls = !fd_memeq( bls_key, no_bls_key, FD_BLS_PUB_COMPRESSED_SZ );
+    int has_bls = !fd_memeq( ele->bls_key, no_bls_key, FD_BLS_PUB_COMPRESSED_SZ );
 
-    enc->total_stake += stake;
+    enc->total_stake += ele->stake;
 
     FD_TEST( ec_cnt<=FD_EPOCH_CREDITS_MAX );
 
     ulong data_length = 186UL + fd_ulong_if( !!has_bls, FD_BLS_PUB_COMPRESSED_SZ, 0UL ) + 24UL * ec_cnt;
 
     /* Vote account key + stake */
-    PUSH_VAL( fd_pubkey_t, pubkey );
-    PUSH_VAL( ulong,       stake  );
+    PUSH_VAL( fd_pubkey_t, ele->pubkey );
+    PUSH_VAL( ulong,       ele->stake  );
 
     /* AccountSharedData: lamports, data_length */
     PUSH_VAL( ulong, 0UL         );
@@ -246,17 +242,17 @@ ENCODE_FN {
 
     /* VoteStateV4 */
     PUSH_VAL( uint,       3U           ); /* variant = V4 */
-    PUSH_VAL( fd_pubkey_t, node_account ); /* node_pubkey */
+    PUSH_VAL( fd_pubkey_t, ele->node_account ); /* node_pubkey */
     PUSH_VAL( fd_pubkey_t, (fd_pubkey_t){0} ); /* authorized_withdrawer */
     PUSH_VAL( fd_pubkey_t, inflation_collector ); /* inflation_rewards_collector */
     PUSH_VAL( fd_pubkey_t, block_collector     ); /* block_revenue_collector */
-    PUSH_VAL( ushort, commission ); /* inflation_rewards_commission_bps */
-    PUSH_VAL( ushort, block_revenue_commission_bps ); /* block_revenue_commission_bps */
-    PUSH_VAL( ulong,  pending_delegator_rewards    ); /* pending_delegator_rewards */
+    PUSH_VAL( ushort, ele->commission ); /* inflation_rewards_commission_bps */
+    PUSH_VAL( ushort, ele->block_revenue_commission_bps ); /* block_revenue_commission_bps */
+    PUSH_VAL( ulong,  ele->pending_delegator_rewards    ); /* pending_delegator_rewards */
     if( has_bls ) {
       typedef struct { uchar b[ FD_BLS_PUB_COMPRESSED_SZ ]; } bls_key_compressed_t;
       PUSH_VAL( uchar, 1        ); /* bls_pubkey_compressed = Some */
-      PUSH_VAL( bls_key_compressed_t, *(bls_key_compressed_t const *)bls_key );
+      PUSH_VAL( bls_key_compressed_t, *(bls_key_compressed_t const *)ele->bls_key );
     } else {
       PUSH_VAL( uchar, 0        ); /* bls_pubkey_compressed = None */
     }
@@ -266,10 +262,17 @@ ENCODE_FN {
 
     /* Epoch credits */
     PUSH_VAL( ulong, ec_cnt );
-    for( ulong j=0UL; j<ec_cnt; j++ ) {
+    for( ulong k=0UL, j=0UL; k<ec_cnt; k++ ) {
+      if( FD_UNLIKELY( k==ag_marker_idx ) ) {
+        PUSH_VAL( ulong, ULONG_MAX );
+        PUSH_VAL( ulong, ULONG_MAX );
+        PUSH_VAL( ulong, ULONG_MAX );
+        continue;
+      }
       PUSH_VAL( ulong, (ulong)ec->epoch[j] );
       PUSH_VAL( ulong, ec->base_credits + (ulong)ec->credits_delta[j] );
       PUSH_VAL( ulong, ec->base_credits + (ulong)ec->prev_credits_delta[j] );
+      j++;
     }
 
     PUSH_VAL( ulong, 0UL ); /* last_timestamp_slot */

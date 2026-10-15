@@ -168,10 +168,6 @@ struct fd_runtime {
 
     struct {
       fd_vote_state_versioned_t vote_state;
-    } deposit_delegator_rewards;
-
-    struct {
-      fd_vote_state_versioned_t vote_state;
     } withdraw;
 
     struct {
@@ -368,15 +364,28 @@ fd_runtime_block_execute_prepare( fd_banks_t *         banks,
 /* fd_runtime_block_execute_finalize finishes the execution of the block
    by applying optional Alpenglow footer effects, paying a fee out to
    the block leader, updating any sysvars, and updating the bank hash.
-   footer is NULL for blocks without an Alpenglow footer.  Returns -1 if
-   the footer is invalid and 0 otherwise. */
+   footer is NULL for blocks without an Alpenglow footer.  cache must
+   not be NULL if footer is not.  Returns -1 if the footer is invalid
+   and 0 otherwise. */
 
 int
 fd_runtime_block_execute_finalize( fd_bank_t *               bank,
                                    fd_accdb_t *              accdb,
                                    fd_capture_ctx_t *        capture_ctx,
                                    fd_block_footer_t const * footer,
-                                   ushort                    shred_version );
+                                   ushort                    shred_version,
+                                   fd_footer_cache_t *       cache );
+
+/* fd_runtime_block_execute_finalize_unverified is
+   fd_runtime_block_execute_finalize for a follower bank's footer whose
+   cert signatures the caller checks itself, concurrently, discarding
+   the bank unless they pass.  No capture or runtime diffs. */
+
+int
+fd_runtime_block_execute_finalize_unverified( fd_bank_t *               bank,
+                                              fd_accdb_t *              accdb,
+                                              fd_block_footer_t const * footer,
+                                              fd_footer_cache_t *       cache );
 
 /* fd_runtime_fee_split computes the burned portion and the leader
    reward for a block's collected fees: half the execution fees burn,
@@ -431,7 +440,9 @@ fd_runtime_cancel_txn( fd_runtime_t *      runtime,
    bundle.  It is responsible for acquiring the union of all accounts
    referenced by all transactions in the bundle.  This is required
    to make sure account acquisition does not get torn across tiles and
-   cause a resource acquisition deadlock. */
+   cause a resource acquisition deadlock.  On preparation failure, stores
+   the returned error in the failing member's err.txn_err; other members'
+   err.txn_err fields are unchanged. */
 
 int
 fd_runtime_prepare_bundle_accounts( fd_runtime_t *      runtime,

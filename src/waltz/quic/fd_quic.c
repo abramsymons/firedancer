@@ -1615,6 +1615,12 @@ fd_quic_handle_v1_initial( fd_quic_t *               quic,
     return FD_QUIC_PARSE_FAIL;
   }
 
+  /* Reject frame-less packets before allocating state (RFC 9000 §12.4). */
+  if( FD_UNLIKELY( body_sz == pkt_number_sz + FD_QUIC_CRYPTO_TAG_SZ ) ) {
+    if( conn ) fd_quic_conn_error( conn, FD_QUIC_CONN_REASON_PROTOCOL_VIOLATION, __LINE__ );
+    return FD_QUIC_PARSE_FAIL;
+  }
+
   /* If no conn, create one. Due to previous checks, role must be server
      and this must be response to Retry (if needed). */
   if( FD_UNLIKELY( !conn ) ) {
@@ -1927,6 +1933,13 @@ fd_quic_handle_v1_handshake(
   ulong         payload_off = pn_offset + pkt_number_sz;
   uchar const * frame_ptr   = cur_ptr + payload_off;
   ulong         frame_sz    = body_sz - pkt_number_sz - FD_QUIC_CRYPTO_TAG_SZ; /* total size of all frames in packet */
+
+  /* Reject frame-less packets (RFC 9000 §12.4). */
+  if( FD_UNLIKELY( frame_sz==0UL ) ) {
+    fd_quic_conn_error( conn, FD_QUIC_CONN_REASON_PROTOCOL_VIOLATION, __LINE__ );
+    return FD_QUIC_PARSE_FAIL;
+  }
+
   while( frame_sz != 0UL ) {
     rc = fd_quic_handle_v1_frame( quic,
                                   conn,
@@ -2133,6 +2146,13 @@ fd_quic_handle_v1_one_rtt( fd_quic_t *      quic,
     return FD_QUIC_PARSE_FAIL;
   }
 
+  /* RFC 9001 Section 5.7: A server MUST NOT process incoming 1-RTT
+     protected packets before the TLS handshake is complete. */
+  if( FD_UNLIKELY( !conn->handshake_complete ) ) {
+    quic->metrics.pkt_no_key_cnt[ fd_quic_enc_level_appdata_id ]++;
+    return FD_QUIC_PARSE_FAIL;
+  }
+
   if( FD_UNLIKELY( tot_sz < (1+FD_QUIC_CONN_ID_SZ+1) ) ) {
     /* One-RTT header: 1 byte
        DCID:           FD_QUIC_CONN_ID_SZ
@@ -2202,6 +2222,13 @@ fd_quic_handle_v1_one_rtt( fd_quic_t *      quic,
   ulong         payload_sz  = tot_sz - pn_offset - pkt_number_sz; /* includes auth tag */
   if( FD_UNLIKELY( payload_sz<FD_QUIC_CRYPTO_TAG_SZ ) ) return FD_QUIC_PARSE_FAIL;
   ulong         frame_sz    = payload_sz - FD_QUIC_CRYPTO_TAG_SZ; /* total size of all frames in packet */
+
+  /* Reject frame-less packets (RFC 9000 §12.4). */
+  if( FD_UNLIKELY( frame_sz==0UL ) ) {
+    fd_quic_conn_error( conn, FD_QUIC_CONN_REASON_PROTOCOL_VIOLATION, __LINE__ );
+    return FD_QUIC_PARSE_FAIL;
+  }
+
   while( frame_sz != 0UL ) {
     ulong rc = fd_quic_handle_v1_frame(
         quic, conn, pkt, FD_QUIC_PKT_TYPE_ONE_RTT,
@@ -2528,6 +2555,8 @@ fd_quic_process_packet_impl( fd_quic_t * quic,
 
     /* multiple QUIC packets in a UDP packet */
     /* shortest valid quic payload? */
+    uchar const * dcid0    = cur_ptr+6;
+    ulong         dcid0_sz = cur_ptr[5];
     ulong pkt_idx;
     for( pkt_idx=0UL; pkt_idx<FD_QUIC_PKT_COALESCE_LIMIT; pkt_idx++ ) {
       /* Are we done? Omit short packet handling that follows */
@@ -2552,6 +2581,13 @@ fd_quic_process_packet_impl( fd_quic_t * quic,
              all packets on a connection must be of the same version (5.2) */
         quic->metrics.pkt_quic_hdr_err_cnt++;
         FD_DEBUG( FD_LOG_DEBUG(( "Mixed QUIC versions in packet" )) );
+        return;
+      }
+
+      /* RFC 9000 Section 12.2: ignore coalesced packets with a different DCID */
+      if( FD_UNLIKELY( cur_ptr[5]!=dcid0_sz || 6UL+dcid0_sz>cur_sz ||
+                       ( pkt_idx && memcmp( cur_ptr+6, dcid0, dcid0_sz ) ) ) ) {
+        quic->metrics.pkt_quic_hdr_err_cnt++;
         return;
       }
 
@@ -3049,13 +3085,13 @@ fd_quic_conn_can_acquire_pkt_meta( fd_quic_conn_t             * conn,
   ulong pool_free = fd_quic_pkt_meta_pool_free( tracker->pool );
   if( !pool_free || conn->used_pkt_meta >= state->max_inflight_frame_cnt_conn ) {
     if( !pool_free ) {
-      metrics->frame_tx_alloc_cnt[FD_METRICS_ENUM_FRAME_TX_ALLOC_RESULT_V_FAIL_EMPTY_POOL_IDX]++;
+      metrics->frame_tx_alloc_cnt[FD_METRICS_ENUM_PKT_META_ACQUIRE_RESULT_V_POOL_EMPTY_IDX]++;
     } else {
-      metrics->frame_tx_alloc_cnt[FD_METRICS_ENUM_FRAME_TX_ALLOC_RESULT_V_FAIL_CONNECTION_MAX_IDX]++;
+      metrics->frame_tx_alloc_cnt[FD_METRICS_ENUM_PKT_META_ACQUIRE_RESULT_V_CONN_LIMIT_IDX]++;
     }
     return 0;
   }
-  metrics->frame_tx_alloc_cnt[FD_METRICS_ENUM_FRAME_TX_ALLOC_RESULT_V_SUCCESS_IDX]++;
+  metrics->frame_tx_alloc_cnt[FD_METRICS_ENUM_PKT_META_ACQUIRE_RESULT_V_SUCCESS_IDX]++;
 
   return 1;
 }

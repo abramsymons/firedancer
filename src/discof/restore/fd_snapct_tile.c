@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "fd_snapct_tile.h"
+
 #include "utils/fd_sspeer.h"
 #include "utils/fd_ssping.h"
 #include "utils/fd_ssctrl.h"
@@ -11,6 +12,8 @@
 #include "../../disco/topo/fd_topo.h"
 #include "../../disco/topo/fd_dns_resolve.h"
 #include "../../disco/metrics/fd_metrics.h"
+#include "../../disco/metrics/fd_metrics_sample.h"
+#include "../../disco/events/fd_event_report.h"
 #include "../../disco/waker/fd_waker.h"
 #include "../../disco/fd_clock_tile.h"
 #include "../../flamenco/gossip/fd_gossip_message.h"
@@ -30,6 +33,30 @@
 
 #include <linux/futex.h>
 #include "generated/fd_snapct_tile_seccomp.h"
+
+/* Raw state values exported by the metrics (states= enums) */
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_INIT==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_INIT_IDX, metrics_state );
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_WAITING_FOR_PEERS==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_WAITING_FOR_PEERS_IDX, metrics_state );
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_WAITING_FOR_PEERS_INCREMENTAL==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_WAITING_FOR_PEERS_INCREMENTAL_IDX, metrics_state );
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_COLLECTING_PEERS==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_COLLECTING_PEERS_IDX, metrics_state );
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_COLLECTING_PEERS_INCREMENTAL==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_COLLECTING_PEERS_INCREMENTAL_IDX, metrics_state );
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_READING_FULL_FILE==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_READING_FULL_FILE_IDX, metrics_state );
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_FLUSHING_FULL_FILE_FINI==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_FLUSHING_FULL_FILE_FINI_IDX, metrics_state );
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_FLUSHING_FULL_FILE_DONE==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_FLUSHING_FULL_FILE_DONE_IDX, metrics_state );
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_FLUSHING_FULL_FILE_RESET==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_FLUSHING_FULL_FILE_RESET_IDX, metrics_state );
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_READING_INCREMENTAL_FILE==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_READING_INCREMENTAL_FILE_IDX, metrics_state );
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_FILE_FINI==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_FLUSHING_INCREMENTAL_FILE_FINI_IDX, metrics_state );
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_FILE_DONE==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_FLUSHING_INCREMENTAL_FILE_DONE_IDX, metrics_state );
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_FILE_RESET==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_FLUSHING_INCREMENTAL_FILE_RESET_IDX, metrics_state );
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_READING_FULL_HTTP==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_READING_FULL_HTTP_IDX, metrics_state );
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_FLUSHING_FULL_HTTP_FINI==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_FLUSHING_FULL_HTTP_FINI_IDX, metrics_state );
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_FLUSHING_FULL_HTTP_DONE==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_FLUSHING_FULL_HTTP_DONE_IDX, metrics_state );
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_FLUSHING_FULL_HTTP_RESET==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_FLUSHING_FULL_HTTP_RESET_IDX, metrics_state );
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_READING_INCREMENTAL_HTTP==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_READING_INCREMENTAL_HTTP_IDX, metrics_state );
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_HTTP_FINI==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_FLUSHING_INCREMENTAL_HTTP_FINI_IDX, metrics_state );
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_HTTP_DONE==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_FLUSHING_INCREMENTAL_HTTP_DONE_IDX, metrics_state );
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_HTTP_RESET==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_FLUSHING_INCREMENTAL_HTTP_RESET_IDX, metrics_state );
+FD_STATIC_ASSERT( FD_SNAPCT_STATE_SHUTDOWN==FD_METRICS_ENUM_SNAPCT_LOAD_STATE_V_SHUTDOWN_IDX, metrics_state );
 
 #define NAME "snapct"
 
@@ -276,20 +303,26 @@ should_shutdown( fd_snapct_tile_t * ctx ) {
 
 static void
 metrics_write( fd_snapct_tile_t * ctx ) {
-  FD_MGAUGE_SET( SNAPCT, FULL_BYTES_READ,               ctx->metrics.full.bytes_read );
-  FD_MGAUGE_SET( SNAPCT, FULL_BYTES_WRITTEN,            ctx->metrics.full.bytes_written );
-  FD_MGAUGE_SET( SNAPCT, FULL_SIZE_BYTES,              ctx->metrics.full.bytes_total );
-  FD_MGAUGE_SET( SNAPCT, FULL_RETRY,          ctx->metrics.full.num_retries );
+  FD_MGAUGE_SET( SNAPCT, READ_PROGRESS_BYTES_FULL,        ctx->metrics.full.bytes_read           );
+  FD_MGAUGE_SET( SNAPCT, READ_PROGRESS_BYTES_INCREMENTAL, ctx->metrics.incremental.bytes_read    );
+  FD_MGAUGE_SET( SNAPCT, READ_EXPECTED_BYTES_FULL,        ctx->metrics.full.bytes_total          );
+  FD_MGAUGE_SET( SNAPCT, READ_EXPECTED_BYTES_INCREMENTAL, ctx->metrics.incremental.bytes_total   );
+  FD_MGAUGE_SET( SNAPCT, SAVE_PROGRESS_BYTES_FULL,        ctx->metrics.full.bytes_written        );
+  FD_MGAUGE_SET( SNAPCT, SAVE_PROGRESS_BYTES_INCREMENTAL, ctx->metrics.incremental.bytes_written );
+  FD_MCNT_SET  ( SNAPCT, LOAD_RETRIED_FULL,               ctx->metrics.full.num_retries          );
+  FD_MCNT_SET  ( SNAPCT, LOAD_RETRIED_INCREMENTAL,        ctx->metrics.incremental.num_retries   );
+  FD_MGAUGE_SET( SNAPCT, PREDICTED_INCREMENTAL_SLOT,      fd_ulong_if( ctx->predicted_incremental.slot==ULONG_MAX, 0UL, ctx->predicted_incremental.slot ) );
+  FD_MGAUGE_SET( SNAPCT, LOAD_STATE,                      (ulong)ctx->state                      );
+}
 
-  FD_MGAUGE_SET( SNAPCT, INCREMENTAL_BYTES_READ,        ctx->metrics.incremental.bytes_read );
-  FD_MGAUGE_SET( SNAPCT, INCREMENTAL_BYTES_WRITTEN,     ctx->metrics.incremental.bytes_written );
-  FD_MGAUGE_SET( SNAPCT, INCREMENTAL_SIZE_BYTES,       ctx->metrics.incremental.bytes_total );
-  FD_MGAUGE_SET( SNAPCT, INCREMENTAL_RETRY,   ctx->metrics.incremental.num_retries );
-
-  FD_MGAUGE_SET( SNAPCT, PREDICTED_SLOT,                ctx->predicted_incremental.slot );
-
-
-  FD_MGAUGE_SET( SNAPCT, STATE, (ulong)ctx->state );
+static void
+set_state( fd_snapct_tile_t * ctx,
+           int                state ) {
+  ctx->state = state;
+  FD_COMPILER_MFENCE();
+  metrics_write( ctx );
+  FD_COMPILER_MFENCE();
+  fd_event_metrics_trigger( FD_METRICS_SAMPLE_REASON_SNAPCT_STATE, 0UL, (ulong)state );
 }
 
 static void
@@ -897,12 +930,12 @@ after_credit( fd_snapct_tile_t *  ctx,
         FD_LOG_NOTICE(( "reading full snapshot from file %s%s%s", fd_log_style_dim(), ctx->local_in.full_snapshot_path, fd_log_style_normal() ));
         FD_LOG_INFO(( "reading full snapshot at slot %lu from local file `%s`", ctx->local_in.full_snapshot_slot, ctx->local_in.full_snapshot_path ));
         ctx->predicted_incremental.full_slot = ctx->local_in.full_snapshot_slot;
-        ctx->state = FD_SNAPCT_STATE_READING_FULL_FILE;
+        set_state( ctx, FD_SNAPCT_STATE_READING_FULL_FILE );
         init_load( ctx, stem, 1, 1 );
         break;
       }
       ctx->deadline_nanos = now+ctx->config.wait_for_peers_timeout_nanos;
-      ctx->state = FD_SNAPCT_STATE_WAITING_FOR_PEERS;
+      set_state( ctx, FD_SNAPCT_STATE_WAITING_FOR_PEERS );
       break;
     }
 
@@ -912,7 +945,7 @@ after_credit( fd_snapct_tile_t *  ctx,
 
       fd_sspeer_t best = fd_sspeer_selector_best( ctx->selector, 0, FD_SSPEER_SLOT_UNKNOWN );
       if( FD_LIKELY( best.addr.l ) ) {
-        ctx->state = FD_SNAPCT_STATE_COLLECTING_PEERS;
+        set_state( ctx, FD_SNAPCT_STATE_COLLECTING_PEERS );
         ctx->deadline_nanos = now+FD_SNAPCT_COLLECTING_PEERS_TIMEOUT;
       }
       break;
@@ -925,7 +958,7 @@ after_credit( fd_snapct_tile_t *  ctx,
       FD_TEST( ctx->predicted_incremental.full_slot!=FD_SSPEER_SLOT_UNKNOWN );
       fd_sspeer_t best = fd_sspeer_selector_best( ctx->selector, 1, ctx->predicted_incremental.full_slot );
       if( FD_LIKELY( best.addr.l ) ) {
-        ctx->state = FD_SNAPCT_STATE_COLLECTING_PEERS_INCREMENTAL;
+        set_state( ctx, FD_SNAPCT_STATE_COLLECTING_PEERS_INCREMENTAL );
         ctx->deadline_nanos = now;
       }
       break;
@@ -941,7 +974,7 @@ after_credit( fd_snapct_tile_t *  ctx,
           FD_LOG_ERR(( "no peers are available and discovery of new peers via gossip is disabled. aborting." ));
         }
         ctx->deadline_nanos = now + ctx->config.wait_for_peers_timeout_nanos;
-        ctx->state = FD_SNAPCT_STATE_WAITING_FOR_PEERS;
+        set_state( ctx, FD_SNAPCT_STATE_WAITING_FOR_PEERS );
         break;
       }
 
@@ -992,7 +1025,7 @@ after_credit( fd_snapct_tile_t *  ctx,
         FD_LOG_INFO(( "reading full snapshot at slot %lu with cluster slot %lu from local file `%s`",
                       ctx->local_in.full_snapshot_slot, cluster_slot, ctx->local_in.full_snapshot_path ));
         ctx->predicted_incremental.full_slot = ctx->local_in.full_snapshot_slot;
-        ctx->state                           = FD_SNAPCT_STATE_READING_FULL_FILE;
+        set_state( ctx, FD_SNAPCT_STATE_READING_FULL_FILE );
         init_load( ctx, stem, 1, 1 );
       } else {
         if( FD_LIKELY( ctx->local_in.full_snapshot_slot!=ULONG_MAX ) ) {
@@ -1025,7 +1058,7 @@ after_credit( fd_snapct_tile_t *  ctx,
         }
 
         ctx->peer                            = best;
-        ctx->state                           = FD_SNAPCT_STATE_READING_FULL_HTTP;
+        set_state( ctx, FD_SNAPCT_STATE_READING_FULL_HTTP );
         ctx->predicted_incremental.full_slot = best.full_slot;
         init_load( ctx, stem, 1, 0 );
       }
@@ -1042,7 +1075,7 @@ after_credit( fd_snapct_tile_t *  ctx,
           FD_LOG_ERR(( "no incremental snapshot peers are available and discovery of new peers via gossip is disabled. aborting." ));
         }
         ctx->deadline_nanos = now + ctx->config.wait_for_peers_timeout_nanos;
-        ctx->state = FD_SNAPCT_STATE_WAITING_FOR_PEERS_INCREMENTAL;
+        set_state( ctx, FD_SNAPCT_STATE_WAITING_FOR_PEERS_INCREMENTAL );
         break;
       }
 
@@ -1058,14 +1091,14 @@ after_credit( fd_snapct_tile_t *  ctx,
 
         FD_LOG_NOTICE(( "reading incremental snapshot from file %s%s%s", fd_log_style_dim(), ctx->local_in.incremental_snapshot_path, fd_log_style_normal() ));
         FD_LOG_INFO(( "reading incremental snapshot at slot %lu from local file `%s`", ctx->local_in.incremental_snapshot_slot, ctx->local_in.incremental_snapshot_path ));
-        ctx->state = FD_SNAPCT_STATE_READING_INCREMENTAL_FILE;
+        set_state( ctx, FD_SNAPCT_STATE_READING_INCREMENTAL_FILE );
         init_load( ctx, stem, 0, 1 );
       } else {
         ctx->predicted_incremental.slot = best.incr_slot;
         send_expected_slot( ctx, stem, best.incr_slot );
 
         ctx->peer  = best;
-        ctx->state = FD_SNAPCT_STATE_READING_INCREMENTAL_HTTP;
+        set_state( ctx, FD_SNAPCT_STATE_READING_INCREMENTAL_HTTP );
         init_load( ctx, stem, 0, 0 );
       }
       break;
@@ -1077,7 +1110,7 @@ after_credit( fd_snapct_tile_t *  ctx,
         ctx->malformed = 0;
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_FAIL, 0UL, 0UL, 0UL, 0UL, 0UL );
         ctx->flush_ack = 0;
-        ctx->state = FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_FILE_RESET;
+        set_state( ctx, FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_FILE_RESET );
         FD_LOG_WARNING(( "failed to load incremental snapshot at slot %lu from local file `%s`",
                          ctx->local_in.incremental_snapshot_slot, ctx->local_in.incremental_snapshot_path ));
         break;
@@ -1085,7 +1118,7 @@ after_credit( fd_snapct_tile_t *  ctx,
 
       if( ctx->flush_ack < ctx->flush_ack_cnt ) break;
 
-      ctx->state = FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_FILE_DONE;
+      set_state( ctx, FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_FILE_DONE );
       fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_DONE, 0UL, 0UL, 0UL, 0UL, 0UL );
       ctx->flush_ack = 0;
       break;
@@ -1096,7 +1129,7 @@ after_credit( fd_snapct_tile_t *  ctx,
         ctx->malformed = 0;
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_FAIL, 0UL, 0UL, 0UL, 0UL, 0UL );
         ctx->flush_ack = 0;
-        ctx->state = FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_FILE_RESET;
+        set_state( ctx, FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_FILE_RESET );
         FD_LOG_WARNING(( "failed to load incremental snapshot at slot %lu from local file `%s`",
                          ctx->local_in.incremental_snapshot_slot, ctx->local_in.incremental_snapshot_path ));
         break;
@@ -1105,7 +1138,7 @@ after_credit( fd_snapct_tile_t *  ctx,
       if( ctx->flush_ack < ctx->flush_ack_cnt ) break;
 
       log_completion( ctx, 0/*incr*/ );
-      ctx->state = FD_SNAPCT_STATE_SHUTDOWN;
+      set_state( ctx, FD_SNAPCT_STATE_SHUTDOWN );
       fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_SHUTDOWN, 0UL, 0UL, 0UL, 0UL, 0UL );
       break;
 
@@ -1115,7 +1148,7 @@ after_credit( fd_snapct_tile_t *  ctx,
         ctx->malformed = 0;
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_FAIL, 0UL, 0UL, 0UL, 0UL, 0UL );
         ctx->flush_ack = 0;
-        ctx->state = FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_HTTP_RESET;
+        set_state( ctx, FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_HTTP_RESET );
         FD_LOG_WARNING(( "failed to load incremental snapshot at slot %lu from http://" FD_IP4_ADDR_FMT ":%hu/%s. "
                          "blacklisting peer due to download failure.",
                          ctx->predicted_incremental.slot,
@@ -1126,7 +1159,7 @@ after_credit( fd_snapct_tile_t *  ctx,
 
       if( ctx->flush_ack < ctx->flush_ack_cnt ) break;
 
-      ctx->state = FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_HTTP_DONE;
+      set_state( ctx, FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_HTTP_DONE );
       fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_DONE, 0UL, 0UL, 0UL, 0UL, 0UL );
       ctx->flush_ack = 0;
       break;
@@ -1137,7 +1170,7 @@ after_credit( fd_snapct_tile_t *  ctx,
         ctx->malformed = 0;
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_FAIL, 0UL, 0UL, 0UL, 0UL, 0UL );
         ctx->flush_ack = 0;
-        ctx->state = FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_HTTP_RESET;
+        set_state( ctx, FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_HTTP_RESET );
         FD_LOG_WARNING(( "failed to load incremental snapshot at slot %lu from http://" FD_IP4_ADDR_FMT ":%hu/%s. "
                          "blacklisting peer due to download failure.",
                          ctx->predicted_incremental.slot,
@@ -1149,7 +1182,7 @@ after_credit( fd_snapct_tile_t *  ctx,
       if( ctx->flush_ack < ctx->flush_ack_cnt ) break;
 
       log_completion( ctx, 0/*incr*/ );
-      ctx->state = FD_SNAPCT_STATE_SHUTDOWN;
+      set_state( ctx, FD_SNAPCT_STATE_SHUTDOWN );
       rename_incr_snapshot( ctx );
       fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_SHUTDOWN, 0UL, 0UL, 0UL, 0UL, 0UL );
       break;
@@ -1160,7 +1193,7 @@ after_credit( fd_snapct_tile_t *  ctx,
         ctx->malformed = 0;
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_FAIL, 0UL, 0UL, 0UL, 0UL, 0UL );
         ctx->flush_ack = 0;
-        ctx->state = FD_SNAPCT_STATE_FLUSHING_FULL_FILE_RESET;
+        set_state( ctx, FD_SNAPCT_STATE_FLUSHING_FULL_FILE_RESET );
         FD_LOG_WARNING(( "failed to load full snapshot at slot %lu from local file `%s`",
                          ctx->local_in.full_snapshot_slot, ctx->local_in.full_snapshot_path ));
         break;
@@ -1168,7 +1201,7 @@ after_credit( fd_snapct_tile_t *  ctx,
 
       if( ctx->flush_ack < ctx->flush_ack_cnt ) break;
 
-      ctx->state = FD_SNAPCT_STATE_FLUSHING_FULL_FILE_DONE;
+      set_state( ctx, FD_SNAPCT_STATE_FLUSHING_FULL_FILE_DONE );
       ulong sig = ctx->config.incremental_snapshots &&
                   (ctx->local_in.incremental_snapshot_slot!=ULONG_MAX || ctx->download_enabled) ? FD_SNAPSHOT_MSG_CTRL_NEXT : FD_SNAPSHOT_MSG_CTRL_DONE;
       if( sig==FD_SNAPSHOT_MSG_CTRL_DONE && ctx->config.incremental_snapshots ) {
@@ -1189,7 +1222,7 @@ after_credit( fd_snapct_tile_t *  ctx,
         ctx->malformed = 0;
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_FAIL, 0UL, 0UL, 0UL, 0UL, 0UL );
         ctx->flush_ack = 0;
-        ctx->state = FD_SNAPCT_STATE_FLUSHING_FULL_FILE_RESET;
+        set_state( ctx, FD_SNAPCT_STATE_FLUSHING_FULL_FILE_RESET );
         FD_LOG_WARNING(( "failed to load full snapshot at slot %lu from local file `%s`",
                          ctx->local_in.full_snapshot_slot, ctx->local_in.full_snapshot_path ));
         break;
@@ -1199,17 +1232,17 @@ after_credit( fd_snapct_tile_t *  ctx,
 
       log_completion( ctx, 1/*full*/ );
       if( FD_LIKELY( !ctx->config.incremental_snapshots ) ) {
-        ctx->state = FD_SNAPCT_STATE_SHUTDOWN;
+        set_state( ctx, FD_SNAPCT_STATE_SHUTDOWN );
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_SHUTDOWN, 0UL, 0UL, 0UL, 0UL, 0UL );
         break;
       }
 
       if( FD_LIKELY( ctx->download_enabled ) ) {
-        ctx->state = FD_SNAPCT_STATE_COLLECTING_PEERS_INCREMENTAL;
+        set_state( ctx, FD_SNAPCT_STATE_COLLECTING_PEERS_INCREMENTAL );
         ctx->deadline_nanos = 0L;
       } else {
         FD_LOG_NOTICE(( "reading incremental snapshot at slot %lu from local file `%s`", ctx->local_in.incremental_snapshot_slot, ctx->local_in.incremental_snapshot_path ));
-        ctx->state = FD_SNAPCT_STATE_READING_INCREMENTAL_FILE;
+        set_state( ctx, FD_SNAPCT_STATE_READING_INCREMENTAL_FILE );
         init_load( ctx, stem, 0, 1 );
       }
       break;
@@ -1220,7 +1253,7 @@ after_credit( fd_snapct_tile_t *  ctx,
         ctx->malformed = 0;
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_FAIL, 0UL, 0UL, 0UL, 0UL, 0UL );
         ctx->flush_ack = 0;
-        ctx->state = FD_SNAPCT_STATE_FLUSHING_FULL_HTTP_RESET;
+        set_state( ctx, FD_SNAPCT_STATE_FLUSHING_FULL_HTTP_RESET );
         FD_LOG_WARNING(( "failed to load full snapshot at slot %lu from http://" FD_IP4_ADDR_FMT ":%hu/%s. "
                          "blacklisting peer due to download failure.",
                          ctx->predicted_incremental.full_slot,
@@ -1231,7 +1264,7 @@ after_credit( fd_snapct_tile_t *  ctx,
 
       if( ctx->flush_ack < ctx->flush_ack_cnt ) break;
 
-      ctx->state = FD_SNAPCT_STATE_FLUSHING_FULL_HTTP_DONE;
+      set_state( ctx, FD_SNAPCT_STATE_FLUSHING_FULL_HTTP_DONE );
       fd_stem_publish( stem, ctx->out_ld.idx, ctx->config.incremental_snapshots ? FD_SNAPSHOT_MSG_CTRL_NEXT : FD_SNAPSHOT_MSG_CTRL_DONE, 0UL, 0UL, 0UL, 0UL, 0UL );
       ctx->flush_ack = 0;
       break;
@@ -1242,7 +1275,7 @@ after_credit( fd_snapct_tile_t *  ctx,
         ctx->malformed = 0;
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_FAIL, 0UL, 0UL, 0UL, 0UL, 0UL );
         ctx->flush_ack = 0;
-        ctx->state = FD_SNAPCT_STATE_FLUSHING_FULL_HTTP_RESET;
+        set_state( ctx, FD_SNAPCT_STATE_FLUSHING_FULL_HTTP_RESET );
         FD_LOG_WARNING(( "failed to load full snapshot at slot %lu from http://" FD_IP4_ADDR_FMT ":%hu/%s. "
                          "blacklisting peer due to download failure.",
                          ctx->predicted_incremental.full_slot,
@@ -1257,7 +1290,7 @@ after_credit( fd_snapct_tile_t *  ctx,
 
       log_completion( ctx, 1/*full*/ );
       if( FD_LIKELY( !ctx->config.incremental_snapshots ) ) {
-        ctx->state = FD_SNAPCT_STATE_SHUTDOWN;
+        set_state( ctx, FD_SNAPCT_STATE_SHUTDOWN );
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_SHUTDOWN, 0UL, 0UL, 0UL, 0UL, 0UL );
         break;
       }
@@ -1266,7 +1299,7 @@ after_credit( fd_snapct_tile_t *  ctx,
       fd_sspeer_t best = fd_sspeer_selector_best( ctx->selector, 1, ctx->predicted_incremental.full_slot );
       if( FD_UNLIKELY( !best.addr.l ) ) {
         ctx->deadline_nanos = now;
-        ctx->state = FD_SNAPCT_STATE_COLLECTING_PEERS_INCREMENTAL;
+        set_state( ctx, FD_SNAPCT_STATE_COLLECTING_PEERS_INCREMENTAL );
         break;
       }
 
@@ -1274,7 +1307,7 @@ after_credit( fd_snapct_tile_t *  ctx,
       send_expected_slot( ctx, stem, best.incr_slot );
 
       ctx->peer  = best;
-      ctx->state = FD_SNAPCT_STATE_READING_INCREMENTAL_HTTP;
+      set_state( ctx, FD_SNAPCT_STATE_READING_INCREMENTAL_HTTP );
       init_load( ctx, stem, 0, 0 );
       break;
 
@@ -1305,7 +1338,7 @@ after_credit( fd_snapct_tile_t *  ctx,
         FD_LOG_ERR(( "unable to load local snapshot %s and no snapshot peers were configured. aborting.", ctx->local_in.full_snapshot_path ));
       } else {
         if( ctx->state==FD_SNAPCT_STATE_FLUSHING_FULL_FILE_RESET ) ctx->local_in.full_snapshot_slot = ULONG_MAX;
-        ctx->state = FD_SNAPCT_STATE_COLLECTING_PEERS;
+        set_state( ctx, FD_SNAPCT_STATE_COLLECTING_PEERS );
         ctx->deadline_nanos = 0L;
       }
       break;
@@ -1333,7 +1366,7 @@ after_credit( fd_snapct_tile_t *  ctx,
         FD_LOG_ERR(( "unable to load local snapshot %s and no snapshot peers were configured. aborting.", ctx->local_in.incremental_snapshot_path ));
       } else {
         if( ctx->state==FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_FILE_RESET ) ctx->local_in.incremental_snapshot_slot = ULONG_MAX;
-        ctx->state = FD_SNAPCT_STATE_COLLECTING_PEERS_INCREMENTAL;
+        set_state( ctx, FD_SNAPCT_STATE_COLLECTING_PEERS_INCREMENTAL );
         ctx->deadline_nanos = 0L;
       }
       break;
@@ -1344,7 +1377,7 @@ after_credit( fd_snapct_tile_t *  ctx,
         ctx->malformed = 0;
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_FAIL, 0UL, 0UL, 0UL, 0UL, 0UL );
         ctx->flush_ack = 0;
-        ctx->state = FD_SNAPCT_STATE_FLUSHING_FULL_FILE_RESET;
+        set_state( ctx, FD_SNAPCT_STATE_FLUSHING_FULL_FILE_RESET );
         FD_LOG_WARNING(( "failed to load full snapshot at slot %lu from local file `%s`",
                          ctx->local_in.full_snapshot_slot, ctx->local_in.full_snapshot_path ));
         break;
@@ -1353,7 +1386,7 @@ after_credit( fd_snapct_tile_t *  ctx,
       if( FD_UNLIKELY( ctx->load_complete ) ) {
         ctx->load_complete = 0;
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_FINI, 0UL, 0UL, 0UL, 0UL, 0UL );
-        ctx->state = FD_SNAPCT_STATE_FLUSHING_FULL_FILE_FINI;
+        set_state( ctx, FD_SNAPCT_STATE_FLUSHING_FULL_FILE_FINI );
         ctx->flush_ack = 0;
       }
       break;
@@ -1364,7 +1397,7 @@ after_credit( fd_snapct_tile_t *  ctx,
         ctx->malformed = 0;
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_FAIL, 0UL, 0UL, 0UL, 0UL, 0UL );
         ctx->flush_ack = 0;
-        ctx->state = FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_FILE_RESET;
+        set_state( ctx, FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_FILE_RESET );
         FD_LOG_WARNING(( "failed to load incremental snapshot at slot %lu from local file `%s`",
                          ctx->local_in.incremental_snapshot_slot, ctx->local_in.incremental_snapshot_path ));
         break;
@@ -1373,7 +1406,7 @@ after_credit( fd_snapct_tile_t *  ctx,
       if( FD_UNLIKELY( ctx->load_complete ) ) {
         ctx->load_complete = 0;
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_FINI, 0UL, 0UL, 0UL, 0UL, 0UL );
-        ctx->state = FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_FILE_FINI;
+        set_state( ctx, FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_FILE_FINI );
         ctx->flush_ack = 0;
       }
       break;
@@ -1384,7 +1417,7 @@ after_credit( fd_snapct_tile_t *  ctx,
         ctx->malformed = 0;
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_FAIL, 0UL, 0UL, 0UL, 0UL, 0UL );
         ctx->flush_ack = 0;
-        ctx->state = FD_SNAPCT_STATE_FLUSHING_FULL_HTTP_RESET;
+        set_state( ctx, FD_SNAPCT_STATE_FLUSHING_FULL_HTTP_RESET );
         FD_LOG_WARNING(( "failed to load full snapshot at slot %lu from http://" FD_IP4_ADDR_FMT ":%hu/%s. "
                          "blacklisting peer due to download failure",
                          ctx->predicted_incremental.full_slot,
@@ -1396,7 +1429,7 @@ after_credit( fd_snapct_tile_t *  ctx,
       if( FD_UNLIKELY( ctx->load_complete ) ) {
         ctx->load_complete = 0;
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_FINI, 0UL, 0UL, 0UL, 0UL, 0UL );
-        ctx->state = FD_SNAPCT_STATE_FLUSHING_FULL_HTTP_FINI;
+        set_state( ctx, FD_SNAPCT_STATE_FLUSHING_FULL_HTTP_FINI );
         ctx->flush_ack = 0;
       }
       break;
@@ -1407,7 +1440,7 @@ after_credit( fd_snapct_tile_t *  ctx,
         ctx->malformed = 0;
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_FAIL, 0UL, 0UL, 0UL, 0UL, 0UL );
         ctx->flush_ack = 0;
-        ctx->state = FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_HTTP_RESET;
+        set_state( ctx, FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_HTTP_RESET );
         FD_LOG_WARNING(( "failed to load incremental snapshot at slot %lu from http://" FD_IP4_ADDR_FMT ":%hu/%s. "
                          "blacklisting peer due to download failure",
                          ctx->predicted_incremental.slot,
@@ -1419,7 +1452,7 @@ after_credit( fd_snapct_tile_t *  ctx,
       if( FD_UNLIKELY( ctx->load_complete ) ) {
         ctx->load_complete = 0;
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_FINI, 0UL, 0UL, 0UL, 0UL, 0UL );
-        ctx->state = FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_HTTP_FINI;
+        set_state( ctx, FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_HTTP_FINI );
         ctx->flush_ack = 0;
       }
       break;
@@ -2305,9 +2338,16 @@ unprivileged_init( fd_topo_t const *      topo,
 
 #include "../../disco/stem/fd_stem.c"
 
+
 #ifndef FD_TILE_TEST
+static ulong
+max_event_sz( fd_topo_tile_t const * tile FD_PARAM_UNUSED ) {
+  return sizeof(fd_event_metrics_trigger_t);
+}
+
 fd_topo_run_tile_t fd_tile_snapct = {
   .name                     = NAME,
+  .max_event_sz             = max_event_sz,
   .rlimit_file_cnt_fn       = rlimit_file_cnt,
   .populate_allowed_seccomp = populate_allowed_seccomp,
   .populate_allowed_fds     = populate_allowed_fds,

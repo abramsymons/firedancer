@@ -14,8 +14,6 @@
 
 /* Error types ********************************************************/
 
-/* FIXME make error types more specific */
-#define FD_SBPF_ERR_INVALID_ELF (1)
 #define FD_SBPF_PROG_RODATA_ALIGN 8UL
 
 /* https://github.com/anza-xyz/sbpf/blob/v0.12.2/src/elf_parser/mod.rs#L17 */
@@ -285,8 +283,9 @@ typedef struct fd_sbpf_loader_config fd_sbpf_loader_config_t;
 FD_PROTOTYPES_BEGIN
 
 /* fd_sbpf_elf_peek partially parses the given ELF file in memory region
-   [bin,bin+bin_sz)  Populates `info`.  Returns `info` on success.  On
-   failure, returns NULL.
+   [bin,bin+bin_sz)  Populates `info`.  Returns FD_SBPF_ELF_SUCCESS (0)
+   on success.  On failure, returns a negative FD_SBPF_ELF_ERR_* error
+   code, and the contents of `info` are unspecified.
 
    elf_deploy_checks: The Agave ELF loader introduced additional checks
    that would fail on (certain) existing mainnet programs. Since it is
@@ -346,8 +345,8 @@ fd_sbpf_program_new( void *                     prog_mem,
    used to allocate a temporary buffer for the parsed rodata sections
    before copying it back into the rodata.  recommended size is bin_sz.
 
-   On success, returns 0.
-   On error, returns FD_SBPF_ERR_*.
+   On success, returns FD_SBPF_ELF_SUCCESS (0).
+   On error, returns a negative FD_SBPF_ELF_ERR_* code.
 
    ### Compliance
 

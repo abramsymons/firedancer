@@ -168,6 +168,7 @@ struct fd_tower_tile {
   uchar                         vote_txn[FD_TPU_PARSED_MTU];
   fd_tower_file_t               vote_history;
   int                           vote_history_pending; /* vote history not yet adopted or dropped */
+  ulong                         vote_history_last;    /* last vote of the vote history from the last switch, 0 if none or behind our root */
 
   uchar __attribute__((aligned(FD_MULTI_EPOCH_LEADERS_ALIGN))) mleaders_mem[ FD_MULTI_EPOCH_LEADERS_FOOTPRINT ];
   uchar __attribute__((aligned(FD_VOTE_STAKES_ITER_ALIGN))) iter_mem[ FD_VOTE_STAKES_ITER_FOOTPRINT ];
@@ -216,23 +217,23 @@ struct fd_tower_tile {
     ulong root_slot;
     ulong init_slot;
 
-    ulong fork[ FD_METRICS_ENUM_TOWER_FORK_DECISION_CNT ];
-    ulong gate[ FD_METRICS_ENUM_TOWER_VOTE_GATE_CNT ];
+    ulong fork[ FD_METRICS_ENUM_TOWER_FORK_RESULT_CNT ];
+    ulong gate[ FD_METRICS_ENUM_TOWER_VOTE_GATE_RESULT_CNT ];
 
     ulong tower_file_write;
     ulong tower_file_slot;
     ulong tower_file_sz;
 
-    ulong votes     [ FD_METRICS_ENUM_VOTE_TXN_RESULT_CNT         ];
-    ulong vote_slots[ FD_METRICS_ENUM_VOTE_SLOT_RESULT_CNT        ];
-    ulong gate_int  [ FD_METRICS_ENUM_VOTE_INTERMEDIATE_GATE_CNT  ];
+    ulong votes     [ FD_METRICS_ENUM_VOTE_TXN_RESULT_CNT                ];
+    ulong vote_slots[ FD_METRICS_ENUM_VOTE_SLOT_RESULT_CNT               ];
+    ulong gate_int  [ FD_METRICS_ENUM_VOTE_INTERMEDIATE_SLOT_RESULT_CNT  ];
 
-    ulong eqvoc_success;
-    ulong eqvoc_err;
+    ulong eqvoc[ FD_METRICS_ENUM_EQVOC_PROOF_RESULT_CNT ];
 
     ulong ghost[ FD_METRICS_ENUM_GHOST_VOTE_RESULT_CNT ];
 
-    ulong hfork[ FD_METRICS_ENUM_HARD_FORK_VOTE_RESULT_CNT ];
+    ulong hfork     [ FD_METRICS_ENUM_HARD_FORK_VOTE_RESULT_CNT       ];
+    ulong hfork_bank[ FD_METRICS_ENUM_HARD_FORK_BANK_HASH_RESULT_CNT ];
 
     ulong hfork_matched_slot;
     ulong hfork_mismatched_slot;

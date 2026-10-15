@@ -23,6 +23,8 @@ struct fd_admin_tile_ctx {
   ulong snap_create_slot_idx;     /* adminctl slot of snapshot-create command */
   ulong snap_create_target_slot;  /* requested slot retained until Replay responds */
   ulong snap_create_start_time;   /* command start retained until Replay responds */
+
+  long poll_ticks;
 };
 
 typedef struct fd_admin_tile_ctx fd_admin_tile_ctx_t;
@@ -96,6 +98,7 @@ unprivileged_init( fd_topo_t const *      topo,
   fd_admin_tile_ctx_t * ctx     = (fd_admin_tile_ctx_t *)scratch;
   ctx->replay_out_idx       = ULONG_MAX;
   ctx->snap_create_slot_idx = ULONG_MAX;
+  ctx->poll_ticks           = (long)(1e6*fd_tempo_tick_per_ns( NULL )); /* 1ms */
   ctx->topo = topo;
 
   fd_topo_obj_t const * adminctl_obj = fd_topo_find_tile_obj( topo, tile, "adminctl" );
@@ -323,11 +326,12 @@ find_identity_keyswitch( fd_admin_tile_ctx_t * ctx,
 }
 
 static int FD_FN_SENSITIVE
-poll_set_identity( fd_admin_tile_ctx_t *   ctx,
-                   ulong *                 state,
-                   ulong                   identity_outset,
-                   uchar *                 keypair,
-                   fd_tower_file_t const * vote_history ) {
+poll_set_identity( fd_admin_tile_ctx_t * ctx,
+                   ulong *               state,
+                   ulong                 identity_outset,
+                   uchar *               keypair,
+                   uchar const *         vote_history,
+                   ulong                 vote_history_sz ) {
   fd_topo_t const * topo = ctx->topo;
 
   switch( *state ) {
@@ -371,10 +375,10 @@ poll_set_identity( fd_admin_tile_ctx_t *   ctx,
       fd_keyswitch_t * voter  = find_identity_keyswitch( ctx, ctx->voter_name );
       voter->param = replay->result;
       memcpy( voter->bytes, keypair+32UL, 32UL );
-      /* Copy in the tower vote history if one exists. */
-      FD_TEST( 40UL+sizeof(fd_tower_file_t)<=sizeof(voter->bytes) );
-      FD_STORE( ulong, voter->bytes+32UL, !!vote_history );
-      if( vote_history ) memcpy( voter->bytes+40UL, vote_history, sizeof(fd_tower_file_t) );
+      /* Copy in the vote history if one exists. */
+      FD_TEST( 40UL+vote_history_sz<=sizeof(voter->bytes) );
+      FD_STORE( ulong, voter->bytes+32UL, vote_history_sz );
+      if( vote_history_sz ) memcpy( voter->bytes+40UL, vote_history, vote_history_sz );
       FD_COMPILER_MFENCE();
       voter->state = FD_KEYSWITCH_STATE_SWITCH_PENDING;
       FD_COMPILER_MFENCE();
@@ -695,15 +699,21 @@ set_identity( fd_admin_tile_ctx_t * ctx,
     return;
   }
 
-  fd_tower_file_t vote_history;
+  fd_tower_file_t tower_file;
+  ulong           wait_to_vote_slot;
+  uchar const *   vote_history    = NULL;
+  ulong           vote_history_sz = 0UL;
   if( req->vote_history_sz ) {
-    if( FD_UNLIKELY( ctx->alpenglow ) ) {
-      FD_LOG_WARNING(( "set-identity failed: vote history files are not supported with Alpenglow" ));
-      report_admin_command_custom_result( &event, "vote_history_unsupported" );
-      fd_adminctl_complete( adminctl, slot_idx, FD_SET_IDENTITY_RESULT_VOTE_HISTORY_UNSUPPORTED );
-      return;
+    int err;
+    if( ctx->alpenglow ) {
+      err             = ag_vote_history_file_scan( req->vote_history, req->vote_history_sz, public_key.uc, &wait_to_vote_slot );
+      vote_history    = (uchar const *)&wait_to_vote_slot;
+      vote_history_sz = sizeof(ulong);
+    } else {
+      err             = fd_tower_file_de( req->vote_history, req->vote_history_sz, &public_key, &tower_file );
+      vote_history    = (uchar const *)&tower_file;
+      vote_history_sz = sizeof(fd_tower_file_t);
     }
-    int err = fd_tower_file_de( req->vote_history, req->vote_history_sz, &public_key, &vote_history );
     if( FD_UNLIKELY( err ) ) {
       FD_LOG_WARNING(( "set-identity failed: invalid vote history file (%i)", err ));
       report_admin_command_custom_result( &event, "invalid_vote_history" );
@@ -715,7 +725,7 @@ set_identity( fd_admin_tile_ctx_t * ctx,
   ulong state           = FD_SET_IDENTITY_STATE_UNLOCKED;
   ulong identity_outset = (ulong)fd_log_wallclock();
   for(;;) {
-    if( FD_UNLIKELY( poll_set_identity( ctx, &state, identity_outset, req->keypair, req->vote_history_sz ? &vote_history : NULL ) ) ) break;
+    if( FD_UNLIKELY( poll_set_identity( ctx, &state, identity_outset, req->keypair, vote_history, vote_history_sz ) ) ) break;
   }
 
   memcpy( ctx->identity_pubkey, req->keypair+32UL, 32UL );
@@ -1300,6 +1310,11 @@ remove_all_authorized_voters( fd_admin_tile_ctx_t * ctx,
   fd_adminctl_complete( adminctl, slot_idx, FD_ADMINCTL_RESULT_SUCCESS );
 }
 
+static inline long
+next_deadline( fd_admin_tile_ctx_t * ctx ) {
+  return fd_tickcount() + ctx->poll_ticks;
+}
+
 static inline void FD_FN_SENSITIVE
 after_credit( fd_admin_tile_ctx_t * ctx,
               fd_stem_context_t *   stem,
@@ -1384,10 +1399,12 @@ populate_allowed_fds( fd_topo_t const *      topo FD_PARAM_UNUSED,
 
 #define STEM_BURST (1UL)
 #define STEM_LAZY  ((long)1e6) /* 1ms */
+#define STEM_ALWAYS_PARK 1
 
 #define STEM_CALLBACK_CONTEXT_TYPE  fd_admin_tile_ctx_t
 #define STEM_CALLBACK_CONTEXT_ALIGN alignof(fd_admin_tile_ctx_t)
 
+#define STEM_CALLBACK_NEXT_DEADLINE next_deadline
 #define STEM_CALLBACK_AFTER_CREDIT after_credit
 #define STEM_CALLBACK_DURING_FRAG  during_frag
 

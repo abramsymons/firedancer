@@ -41,13 +41,13 @@ store_insert_payload( fd_store_t *      store,
                       int               fd,
                       fd_hash_t const * key,
                       uchar             value ) {
-  fd_store_fec_t * fec;
-  FD_TEST( !fd_store_insert( store, map, key, 0UL, 0UL, &fec ) && fec );
-  uchar * data = fd_store_fec_data_acquire( store, fd, fec );
+  uint    data_idx;
+  uchar * data = fd_store_fec_data_reserve( store, fd, &data_idx, NULL );
   FD_TEST( data );
-  data[0]      = value;
-  fec->data_sz = 1UL;
-  fd_store_fec_data_publish( store, fec );
+  data[0] = value;
+  ushort shred_sz[ FD_FEC_SHRED_CNT ] = { 1 };
+  fd_store_fec_t * fec;
+  FD_TEST( !fd_store_insert( store, map, key, 0UL, 0UL, data_idx, 1U, shred_sz, &fec ) && fec );
   return fec;
 }
 
@@ -107,8 +107,6 @@ test_store_release( fd_wksp_t * wksp ) {
 
   FD_TEST( !fd_store_query( map, &a ) );
   FD_TEST( fd_store_query( map, &b )==fec_b );
-  FD_TEST( store->spill_reclaim_cnt==1UL );
-  FD_TEST( fd_store_disk_maintain( store, fd ) );
   FD_TEST( store->spill_free_cnt==1UL );
 
   /* Invalid orphan release. */

@@ -25,6 +25,7 @@ struct __attribute__((aligned(FD_HISTF_ALIGN))) fd_histf_private {
   ulong counts[ FD_HISTF_BUCKET_CNT ];
   /* A value x belongs to bucket i if
      left_edge[i] <= x - 2^63 < left_edge[i+1].
+     The overflow bucket has no upper bound.
 
      For AVX2, there's no unsiged comparison instruction.  We follow
      what wv_gt does and implement it by subtracting 2^63 from each
@@ -40,6 +41,29 @@ FD_PROTOTYPES_BEGIN
 
 FD_FN_CONST static inline ulong fd_histf_align    ( void ) { return FD_HISTF_ALIGN;     }
 FD_FN_CONST static inline ulong fd_histf_footprint( void ) { return FD_HISTF_FOOTPRINT; }
+
+/* fd_histf_new_edges is fd_histf_new with caller supplied bucket
+   edges.  edges[i] is the left edge of bucket i+1, so bucket 0 is
+   [ 0, edges[0] ) and bucket 15 is [ edges[14], inf ).  Edges must be
+   nonzero and strictly increasing.  Returns NULL on bad edges. */
+
+static inline void *
+fd_histf_new_edges( void *      mem,
+                    ulong const edges[ FD_HISTF_BUCKET_CNT-1UL ] ) {
+  if( FD_UNLIKELY( !edges[ 0 ] ) ) return NULL;
+  for( ulong i=1UL; i<(FD_HISTF_BUCKET_CNT-1UL); i++ ) {
+    if( FD_UNLIKELY( edges[ i ]<=edges[ i-1UL ] ) ) return NULL;
+  }
+
+  fd_histf_t * hist = (fd_histf_t*)mem;
+  fd_memset( hist->counts, 0, FD_HISTF_BUCKET_CNT*sizeof(ulong) );
+  hist->sum = 0UL;
+  hist->left_edge[ 0 ] = (long)(0UL - (1UL<<63));
+  for( ulong i=0UL; i<(FD_HISTF_BUCKET_CNT-1UL); i++ ) hist->left_edge[ i+1UL ] = (long)(edges[ i ] - (1UL<<63));
+  hist->left_edge[ FD_HISTF_BUCKET_CNT ] = LONG_MAX;
+
+  return (void*)hist;
+}
 
 /* fd_histf_new takes ownership of the memory region pointed to by mem
    (which is assumed to be non-NULL with the appropriate alignment and
@@ -98,10 +122,7 @@ fd_histf_new( void * mem,
   min_value = fd_ulong_max( min_value, 1UL );
   max_value = fd_ulong_max( max_value, min_value + FD_HISTF_BUCKET_CNT - 2UL );
 
-  fd_histf_t * hist = (fd_histf_t*)mem;
-  fd_memset( hist->counts, 0, FD_HISTF_BUCKET_CNT*sizeof(ulong) );
-  hist->sum = 0UL;
-  ulong left_edge[ FD_HISTF_BUCKET_CNT ]; /* without the -2^63 shift */
+  ulong left_edge[ FD_HISTF_BUCKET_CNT ];
   left_edge[ 0 ] = 0;
   left_edge[ 1 ] = min_value;
   for( ulong i=2UL; i<(FD_HISTF_BUCKET_CNT-1UL); i++ ) {
@@ -115,10 +136,7 @@ fd_histf_new( void * mem,
   }
   left_edge[ FD_HISTF_BUCKET_CNT - 1UL ] = max_value;
 
-  for( ulong i=0UL; i<FD_HISTF_BUCKET_CNT; i++ ) hist->left_edge[ i ] = (long)(left_edge[ i ] - (1UL<<63));
-  hist->left_edge[ FD_HISTF_BUCKET_CNT ] = LONG_MAX;
-
-  return (void*)hist;
+  return fd_histf_new_edges( mem, left_edge+1UL );
 }
 
 static inline fd_histf_t * fd_histf_join  ( void       * _hist ) { return (fd_histf_t *)_hist; }
@@ -141,6 +159,7 @@ fd_histf_sample( fd_histf_t * hist,
   /* !(x-2^63 < left_edge[i]) & (x-2^63 < left_edge[i+1])  <=>
      left_edge[i] <= x-2^63 < left_edge[i+1].  Vector compares yield
      0/-1 lanes. */
+  fd_histf_v4l_t const overflow_mask = { 0L, 0L, 0L, -1L };
   fd_histf_v4l_t select0 = ~( x < *(fd_histf_v4l_t   const *)(hist->left_edge      ) )
                           & ( x < *(fd_histf_v4l_u_t const *)(hist->left_edge+ 1UL ) );
   fd_histf_v4l_t select1 = ~( x < *(fd_histf_v4l_t   const *)(hist->left_edge+ 4UL ) )
@@ -148,7 +167,7 @@ fd_histf_sample( fd_histf_t * hist,
   fd_histf_v4l_t select2 = ~( x < *(fd_histf_v4l_t   const *)(hist->left_edge+ 8UL ) )
                           & ( x < *(fd_histf_v4l_u_t const *)(hist->left_edge+ 9UL ) );
   fd_histf_v4l_t select3 = ~( x < *(fd_histf_v4l_t   const *)(hist->left_edge+12UL ) )
-                          & ( x < *(fd_histf_v4l_u_t const *)(hist->left_edge+13UL ) );
+                          & ((x < *(fd_histf_v4l_u_t const *)(hist->left_edge+13UL )) | overflow_mask );
   /* In exactly one of these, we have a -1 (aka ULONG_MAX).  We'll
      subtract that from the counts, effectively adding 1. */
   *(fd_histf_v4l_t *)(hist->counts      ) -= select0;
@@ -156,7 +175,8 @@ fd_histf_sample( fd_histf_t * hist,
   *(fd_histf_v4l_t *)(hist->counts+ 8UL ) -= select2;
   *(fd_histf_v4l_t *)(hist->counts+12UL ) -= select3;
 #else
-  for( ulong i=0UL; i<16UL; i++ ) hist->counts[ i ] += (ulong)( (hist->left_edge[ i ] <= shifted_v) & (shifted_v < hist->left_edge[ i+1UL ]) );
+  for( ulong i=0UL; i<FD_HISTF_BUCKET_CNT; i++ ) hist->counts[ i ] += (ulong)( (hist->left_edge[ i ] <= shifted_v) & (shifted_v < hist->left_edge[ i+1UL ]) );
+  hist->counts[ FD_HISTF_BUCKET_CNT-1UL ] += (ulong)(shifted_v == LONG_MAX);
 #endif
 }
 
@@ -165,6 +185,7 @@ fd_histf_sample( fd_histf_t * hist,
 
    fd_histf_{left,right} get the sample values that map to bucket b,
    with a half-open interval [left, right).
+   The overflow bucket has no upper bound; right returns ULONG_MAX.
 
    fd_histf_sum gets the sum of all samples that have been added.  I.e.
    fd_histf_sum() / sum(fd_histf_cnt(j) for j in [0, 16)) is the average

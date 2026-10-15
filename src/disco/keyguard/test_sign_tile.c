@@ -34,8 +34,7 @@ setup( void ) {
   ctx.public_key  = identity_key+32UL;
   ctx.bls_keys    = keys;
   derive_fields( &ctx );
-  FD_TEST( fd_histf_join( fd_histf_new( ctx.sign_duration, FD_MHIST_SECONDS_MIN( SIGN, SIGN_DURATION_SECONDS ),
-                                                         FD_MHIST_SECONDS_MAX( SIGN, SIGN_DURATION_SECONDS ) ) ) );
+  FD_TEST( fd_histf_join( fd_metrics_histf_new_ns( ctx.sign_duration, FD_MHIST_EDGES_NS( SIGN, SIGN_DURATION_NANOS ) ) ) );
 
   client.request        = fd_mcache_join( fd_mcache_new( request_mcache_mem, TEST_DEPTH, 0UL, 0UL ) );
   client.response       = fd_mcache_join( fd_mcache_new( response_mcache_mem, TEST_DEPTH, 0UL, 0UL ) );
@@ -133,8 +132,10 @@ test_bls_request_signing( void ) {
       FD_TEST( !memcmp( request_data, payload, payload_sz ) );
       fd_bls_sig_t sig[1];
       FD_TEST( !fd_bls_sig_de( sig, signature ) );
-      FD_TEST(  fd_bls_agg_verify( payload, payload_sz, &public_keys[i], sig ) );
-      FD_TEST( !fd_bls_agg_verify( payload, payload_sz, &public_keys[1UL-i], sig ) );
+      blst_p2 one[1]; blst_p2_from_affine( one, sig );
+      blst_p1 pub[2]; blst_p1_from_affine( pub, public_keys ); blst_p1_from_affine( pub+1, public_keys+1 );
+      FD_TEST(  fd_bls_agg_verify( payload, payload_sz, &pub[i], one ) );
+      FD_TEST( !fd_bls_agg_verify( payload, payload_sz, &pub[1UL-i], one ) );
     }
   }
   FD_TEST( !pthread_join( signer, NULL ) );

@@ -10,6 +10,7 @@
 #include "../../flamenco/runtime/fd_txncache.h"
 #include "../../flamenco/runtime/fd_txncache_shmem.h"
 #include "../../flamenco/runtime/fd_txncache_private.h"
+#include "../../flamenco/runtime/sysvar/fd_sysvar_epoch_schedule.h"
 #include "../../flamenco/runtime/sysvar/fd_sysvar_slot_history.h"
 #if FD_HAS_RACESAN
 #include "../../util/racesan/fd_racesan.h"
@@ -59,39 +60,53 @@ test_allocs_reclaim( fd_wksp_t * wksp ) {
 
 static void
 seed_epoch_credits( fd_bank_t * bank ) {
-  ulong len = *fd_bank_epoch_credits_len( bank );
-  FD_TEST( len==VALIDATOR_CNT );
+  fd_epoch_credits_view_t view[1];
+  FD_TEST( fd_epoch_credits_view_init( view, fd_bank_epoch_credits( bank ), bank->epoch_credits_fork_id ) );
+  FD_TEST( view->len==VALIDATOR_CNT );
   FD_TEST( EPOCH_CREDITS_CNT<=FD_EPOCH_CREDITS_MAX );
-  for( ulong i=0UL; i<len; i++ ) {
-    fd_epoch_credits_t * ec = &fd_bank_epoch_credits( bank )[ i ];
-    ec->cnt          = EPOCH_CREDITS_CNT;
-    ec->commission   = (ushort)( 4321U + i );
-    ec->base_credits = 10000UL + 1000UL*i;
+  bank->f.alpenglow_migration_slot = fd_epoch_slot0( &bank->f.epoch_schedule, EPOCH_CREDITS_CNT );
+  for( ulong i=0UL; i<view->len; i++ ) {
+    fd_epoch_credits_t * ec     = &view->credits[ i ];
+    ec->cnt                     = EPOCH_CREDITS_CNT;
+    ec->commission              = (ushort)( 4321U + i );
+    ec->base_credits            = 10000UL + 1000UL*i;
+    ec->has_ag_migration_marker = i==1UL;
     for( ulong j=0UL; j<EPOCH_CREDITS_CNT; j++ ) {
       ec->epoch[ j ]              = (ushort)( j+1UL );
       ec->prev_credits_delta[ j ] = (uint)( 100UL*j + 7UL*i );
       ec->credits_delta[ j ]      = (uint)( 100UL*j + 7UL*i + 50UL );
     }
   }
+  fd_epoch_credits_view_fini( view );
 }
 
 static void
 check_epoch_credits( fd_bank_t *                                bank,
                      fd_snapshot_manifest_vote_stakes_t const * vs ) {
-  fd_epoch_credits_t const * ec  = NULL;
-  ulong                      len = *fd_bank_epoch_credits_len( bank );
-  for( ulong i=0UL; i<len; i++ ) {
-    fd_epoch_credits_t const * cand = &fd_bank_epoch_credits( bank )[ i ];
+  fd_epoch_credits_view_t view[1];
+  FD_TEST( fd_epoch_credits_view_init( view, fd_bank_epoch_credits( bank ), bank->epoch_credits_fork_id ) );
+  fd_epoch_credits_t const * ec = NULL;
+  for( ulong i=0UL; i<view->len; i++ ) {
+    fd_epoch_credits_t const * cand = &view->credits[ i ];
     if( !memcmp( cand->pubkey, vs->vote, 32UL ) ) { ec = cand; break; }
   }
   FD_TEST( ec );
   FD_TEST( ec->cnt==EPOCH_CREDITS_CNT );
-  FD_TEST( vs->epoch_credits_history_len==ec->cnt );
-  for( ulong j=0UL; j<ec->cnt; j++ ) {
-    FD_TEST( vs->epoch_credits[j].epoch       ==(ulong)ec->epoch[j] );
-    FD_TEST( vs->epoch_credits[j].credits     ==ec->base_credits+(ulong)ec->credits_delta[j] );
-    FD_TEST( vs->epoch_credits[j].prev_credits==ec->base_credits+(ulong)ec->prev_credits_delta[j] );
+  ulong ag_marker_idx = ec->has_ag_migration_marker ? EPOCH_CREDITS_CNT-1UL : ULONG_MAX;
+  FD_TEST( vs->epoch_credits_history_len==ec->cnt+(ulong)ec->has_ag_migration_marker );
+  for( ulong k=0UL, j=0UL; k<vs->epoch_credits_history_len; k++ ) {
+    if( k==ag_marker_idx ) {
+      FD_TEST( vs->epoch_credits[k].epoch       ==ULONG_MAX );
+      FD_TEST( vs->epoch_credits[k].credits     ==ULONG_MAX );
+      FD_TEST( vs->epoch_credits[k].prev_credits==ULONG_MAX );
+      continue;
+    }
+    FD_TEST( vs->epoch_credits[k].epoch       ==(ulong)ec->epoch[j] );
+    FD_TEST( vs->epoch_credits[k].credits     ==ec->base_credits+(ulong)ec->credits_delta[j] );
+    FD_TEST( vs->epoch_credits[k].prev_credits==ec->base_credits+(ulong)ec->prev_credits_delta[j] );
+    j++;
   }
+  fd_epoch_credits_view_fini( view );
 }
 
 typedef struct {
@@ -290,8 +305,10 @@ test_manifest_roundtrip( fd_svm_mini_t * mini,
        !fd_vote_stakes_iter_done( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_1, iter );
        fd_vote_stakes_iter_next( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_1, iter ) ) {
     FD_TEST( vote_cnt<VALIDATOR_CNT );
-    fd_vote_stakes_iter_ele( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_1, iter, &votes[ vote_cnt ], &identities[ vote_cnt ], NULL,
-                             NULL, NULL, NULL, NULL, NULL, NULL, NULL );
+    fd_vote_stakes_ele_t ele[1];
+    fd_vote_stakes_iter_ele( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_1, iter, ele );
+    votes     [ vote_cnt ] = ele->pubkey;
+    identities[ vote_cnt ] = ele->node_account;
     vote_cnt++;
   }
   FD_TEST( vote_cnt==VALIDATOR_CNT );
@@ -300,11 +317,29 @@ test_manifest_roundtrip( fd_svm_mini_t * mini,
   bank->vote_stakes_fork_id = fd_vote_stakes_init( vote_stakes, bank->f.epoch );
   fork_id = bank->vote_stakes_fork_id;
   uchar const no_bls[ FD_BLS_PUBKEY_COMPRESSED_SZ ] = {0};
+
+  /* Non-default SIMD-0123 fields and SIMD-0232 collectors: distinct
+     inflation and block collectors for vote0 in the t_1 set, a
+     block-only collector for vote1 in the t_2 set, and SIMD-0123 fields
+     for vote0 in the t_3 set. */
+  fd_pubkey_t vote0 = votes[0];
+  fd_pubkey_t vote1 = votes[1];
+  fd_pubkey_t infl0 = { .ul = { 0xAA, 1 } };
+  fd_pubkey_t blk0  = { .ul = { 0xBB, 2 } };
+  fd_pubkey_t blk1  = { .ul = { 0xCC, 3 } };
   for( ulong i=0UL; i<VALIDATOR_CNT; i++ ) {
-    fd_vote_stakes_snap_insert_t_1( vote_stakes, fork_id, &votes[i], &identities[i], 1000000000UL, 1234U, no_bls );
-    fd_vote_stakes_snap_insert_t_2( vote_stakes, fork_id, &votes[i], &identities[i], 1000000000UL, 1234U, no_bls );
+    int is0 = i==0UL;
+    int is1 = i==1UL;
+    fd_vote_stakes_snap_insert_t_1( vote_stakes, fork_id, &votes[i], &identities[i], 1000000000UL, 1234U, no_bls,
+                                    is0 ? 2500U : FD_VOTE_DEFAULT_BLOCK_REVENUE_COMMISSION_BPS, is0 ? 777UL : 0UL,
+                                    is0 ? &infl0 : NULL, is0 ? &blk0 : NULL );
+    fd_vote_stakes_snap_insert_t_2( vote_stakes, fork_id, &votes[i], &identities[i], 1000000000UL, 1234U, no_bls,
+                                    is1 ? 1234U : FD_VOTE_DEFAULT_BLOCK_REVENUE_COMMISSION_BPS, is1 ? 55UL : 0UL,
+                                    NULL, is1 ? &blk1 : NULL );
     for( ulong n=3UL; n<=5UL; n++ ) {
-      fd_vote_stakes_snap_insert_t_n( vote_stakes, fork_id, n, &votes[i], &identities[i], 1000000UL*n, (ushort)(100UL*n), no_bls );
+      int t3_0 = is0 && n==3UL;
+      fd_vote_stakes_snap_insert_t_n( vote_stakes, fork_id, n, &votes[i], &identities[i], 1000000UL*n, (ushort)(100UL*n), no_bls,
+                                      t3_0 ? 4321U : FD_VOTE_DEFAULT_BLOCK_REVENUE_COMMISSION_BPS, t3_0 ? 99UL : 0UL, NULL, NULL );
     }
   }
 
@@ -333,30 +368,14 @@ test_manifest_roundtrip( fd_svm_mini_t * mini,
   ulong const late_epoch = bank->f.epoch+1UL;
   put_vote_account( mini, &extra_vote, &identities[0], 1UL, voter_epochs, &extra_voter );
   put_vote_account( mini, &late_vote,  &late_node,     1UL, &late_epoch,  &late_voter  );
-  fd_vote_stakes_snap_insert_t_n( vote_stakes, fork_id, 3UL, &extra_vote,   &identities[0], 3000000UL, 300U, no_bls );
-  fd_vote_stakes_snap_insert_t_n( vote_stakes, fork_id, 3UL, &phantom_vote, &phantom_node,  3000000UL, 300U, no_bls );
-  fd_vote_stakes_snap_insert_t_n( vote_stakes, fork_id, 3UL, &late_vote,    &late_node,     3000000UL, 300U, no_bls );
-
-  /* Set non-default SIMD-0232 collectors: distinct inflation and block
-     collectors for vote0 on the t_1 tag (epoch), and a block-only
-     override for vote1 on the t_2 tag (epoch-1). */
-  fd_pubkey_t vote0 = votes[0];
-  fd_pubkey_t vote1 = votes[1];
-
-  fd_pubkey_t infl0 = { .ul = { 0xAA, 1 } };
-  fd_pubkey_t blk0  = { .ul = { 0xBB, 2 } };
-  fd_pubkey_t blk1  = { .ul = { 0xCC, 3 } };
-  fd_collector_overrides_t * co = fd_bank_collector_overrides( bank );
-  ushort co_root = fd_collector_overrides_get_root_idx( co );
-  fd_collector_overrides_upsert( co, co_root, bank->f.epoch,     &vote0, 1, &infl0, 1, &blk0 );
-  fd_collector_overrides_upsert( co, co_root, bank->f.epoch-1UL, &vote1, 0, NULL,   1, &blk1 );
-
-  /* SIMD-0123 fields: vote0 on the t_1 set, vote1 on the t_2 set. */
-  fd_vote_stakes_set_block_revenue_t_1( vote_stakes, fork_id, &vote0, 2500U, 777UL );
-  fd_vote_stakes_set_block_revenue_t_2( vote_stakes, fork_id, &vote1, 1234U, 55UL );
-  fd_vote_stakes_set_block_revenue_t_n( vote_stakes, fork_id, 3UL, &vote0, 4321U, 99UL );
+  fd_vote_stakes_snap_insert_t_n( vote_stakes, fork_id, 3UL, &extra_vote,   &identities[0], 3000000UL, 300U, no_bls, FD_VOTE_DEFAULT_BLOCK_REVENUE_COMMISSION_BPS, 0UL, NULL, NULL );
+  fd_vote_stakes_snap_insert_t_n( vote_stakes, fork_id, 3UL, &phantom_vote, &phantom_node,  3000000UL, 300U, no_bls, FD_VOTE_DEFAULT_BLOCK_REVENUE_COMMISSION_BPS, 0UL, NULL, NULL );
+  fd_vote_stakes_snap_insert_t_n( vote_stakes, fork_id, 3UL, &late_vote,    &late_node,     3000000UL, 300U, no_bls, FD_VOTE_DEFAULT_BLOCK_REVENUE_COMMISSION_BPS, 0UL, NULL, NULL );
 
   seed_epoch_credits( bank );
+
+  fd_epoch_credits_view_t epoch_credits_view[1];
+  FD_TEST( fd_epoch_credits_view_init( epoch_credits_view, fd_bank_epoch_credits( bank ), bank->epoch_credits_fork_id ) );
 
   fd_ssmanifest_writer_t * writer   = test_alloc( wksp, alignof(fd_ssmanifest_writer_t), sizeof(fd_ssmanifest_writer_t) );
   uchar *                  acc_data = test_alloc( wksp, 1UL, FD_RUNTIME_ACC_SZ_MAX );
@@ -420,6 +439,7 @@ test_manifest_roundtrip( fd_svm_mini_t * mini,
   FD_TEST( injected );
   FD_TEST( stake_delegations_len_off!=ULONG_MAX );
   FD_TEST( total_written==manifest_sz+stake_delegation_sz );
+  fd_epoch_credits_view_fini( epoch_credits_view );
 
   /* Epoch stakes maps: every set lists each vote account with its
      authorized voter and under its node.  The parser discards both
@@ -514,10 +534,9 @@ test_manifest_roundtrip( fd_svm_mini_t * mini,
   }
   FD_TEST( !found_stake_delegation );
 
-  /* Collector round-trip: the encoder tags t_1 entries (epoch_stakes
-     key epoch+1) with the epoch override tag and t_2 entries (key
-     epoch) with the epoch-1 tag; t_3..t_5 entries (keys epoch-1..
-     epoch-3) are encoded with zero collectors. */
+  /* Collector round-trip: the encoder writes the collectors of the t_1
+     set (epoch_stakes key epoch+1) and the t_2 set (key epoch); t_3..t_5
+     entries (keys epoch-1..epoch-3) are encoded with zero collectors. */
   {
     fd_snapshot_manifest_epoch_stakes_t const * t1 = NULL;
     fd_snapshot_manifest_epoch_stakes_t const * t2 = NULL;
@@ -645,6 +664,180 @@ serialize_all( fd_wksp_t *            wksp,
   fd_wksp_free_laddr( chunk );
   *out_sz = sz;
   return buf;
+}
+
+/* hash_index values in the blockhash queue can skip (see
+   fd_blockhashes.h), when agave-ledger-tool re-registers a blockhash.
+   Serialize a bank whose queue skips indices, parse the manifest back,
+   and check that the manifest carries exactly the queue's entries, each
+   at its own absolute hash_index, with the newest one as the last hash
+   index, which is what preserves every entry's age.  (Reloading a queue
+   with skipped indices is covered by test_ssload.)
+
+   Queue: hash_index base+0 .. base+5 with base+2 and base+3 skipped, so
+   the entries are at ages 5, 4, 1 and 0.  A nonzero base checks that
+   indices are written as stored, not rebased. */
+
+static void
+test_manifest_roundtrip_blockhash_holes( fd_svm_mini_t * mini,
+                                         fd_bank_t *     bank ) {
+  FD_LOG_NOTICE(( "test_manifest_roundtrip_blockhash_holes" ));
+  fd_wksp_t * wksp = mini->wksp;
+
+  ulong const span = 6UL;
+  ulong const base = 2417612UL;
+# define IS_HOLE(i) ( (i)==2UL || (i)==3UL )
+
+  fd_blockhashes_t * bhq = fd_blockhashes_init( &bank->f.block_hash_queue, 99UL );
+  FD_TEST( bhq );
+  for( ulong i=0UL; i<span; i++ ) {
+    if( IS_HOLE( i ) ) continue;
+    fd_blockhash_info_t * info = fd_blockhash_deq_push_tail_nocopy( bhq->d.deque );
+    fd_memset( info, 0, sizeof(fd_blockhash_info_t) );
+    fd_memset( info->hash.uc, (int)(0x30+i), 32UL );
+    info->lamports_per_signature = 7000UL+i;
+    info->hash_index             = base+i;
+    fd_blockhash_map_ele_insert( bhq->map, info, bhq->d.deque );
+  }
+
+  fd_epoch_credits_view_t epoch_credits_view[1];
+  FD_TEST( fd_epoch_credits_view_init( epoch_credits_view, fd_bank_epoch_credits( bank ), bank->epoch_credits_fork_id ) );
+
+  fd_ssmanifest_writer_t * writer   = test_alloc( wksp, alignof(fd_ssmanifest_writer_t), sizeof(fd_ssmanifest_writer_t) );
+  uchar *                  acc_data = test_alloc( wksp, 1UL, FD_RUNTIME_ACC_SZ_MAX );
+  fd_pubkey_t leader = {0};
+  fd_ssmanifest_writer_init( writer, bank, &leader, mini->runtime->accdb, bank->accdb_fork_id, acc_data );
+  ulong manifest_sz = writer->serialized_sz;
+  FD_TEST( manifest_sz>0UL );
+
+  uchar * buf       = test_alloc( wksp, alignof(uchar), manifest_sz );
+  uchar * chunk_buf = test_alloc( wksp, alignof(uchar), FD_SSMANIFEST_BUF_MIN );
+  ulong   written   = 0UL;
+  for(;;) {
+    ulong sz = fd_snap_manifest_serialize( writer, chunk_buf, FD_SSMANIFEST_BUF_MIN );
+    if( !sz ) break;
+    FD_TEST( written+sz<=manifest_sz );
+    memcpy( buf+written, chunk_buf, sz );
+    written += sz;
+  }
+  FD_TEST( written==manifest_sz );
+  fd_epoch_credits_view_fini( epoch_credits_view );
+
+  fd_snapshot_manifest_t * manifest = test_alloc( wksp, alignof(fd_snapshot_manifest_t), sizeof(fd_snapshot_manifest_t) );
+  memset( manifest, 0, sizeof(fd_snapshot_manifest_t) );
+  void * parser_mem = test_alloc( wksp, fd_ssmanifest_parser_align(), fd_ssmanifest_parser_footprint() );
+  fd_ssmanifest_parser_t * parser = fd_ssmanifest_parser_join( fd_ssmanifest_parser_new( parser_mem ) );
+  FD_TEST( parser );
+  fd_ssmanifest_parser_init( parser, manifest );
+  int result = fd_ssmanifest_parser_consume( parser, buf, written );
+  FD_TEST( result==FD_SSMANIFEST_PARSER_ADVANCE_DONE || result==FD_SSMANIFEST_PARSER_ADVANCE_AGAIN );
+  FD_TEST( fd_ssmanifest_parser_fini( parser )==FD_SSMANIFEST_PARSER_ADVANCE_DONE );
+
+  /* Holes are not entries: four live entries, each at its relative
+     hash_index, so the gaps at 2 and 3 are preserved on the wire. */
+  FD_TEST( manifest->blockhashes_len==4UL );
+  ulong seen = 0UL;
+  for( ulong j=0UL; j<manifest->blockhashes_len; j++ ) {
+    fd_snapshot_manifest_blockhash_t const * e = &manifest->blockhashes[ j ];
+    FD_TEST( e->hash_index>=base );
+    ulong i = e->hash_index-base;
+    FD_TEST( i<span && !IS_HOLE( i ) );
+    FD_TEST( !( seen & (1UL<<i) ) );
+    seen |= 1UL<<i;
+    uchar expect[ 32UL ]; fd_memset( expect, (int)(0x30+i), 32UL );
+    FD_TEST( !memcmp( e->hash, expect, 32UL ) );
+    FD_TEST( e->lamports_per_signature==7000UL+i );
+  }
+  FD_TEST( seen==( (1UL<<0) | (1UL<<1) | (1UL<<4) | (1UL<<5) ) );
+
+# undef IS_HOLE
+  fd_wksp_free_laddr( parser_mem );
+}
+
+/* With skipped hash indices, Agave's lazy purge (it only purges once
+   the queue holds max_age entries) can leave an entry older than
+   max_age, and that entry can still be one of the newest 150 that the
+   RecentBlockhashes sysvar is built from.  The snapshot must keep it:
+   the encoder writes the newest FD_BLOCKHASHES_MAX entries by count,
+   not by age.
+
+   Queue: 10 entries, the oldest at base+0 and the rest at base+400 ..
+   base+408, so the oldest is at age 408, past max_age=300. */
+
+static void
+test_manifest_roundtrip_blockhash_old_entry( fd_svm_mini_t * mini,
+                                             fd_bank_t *     bank ) {
+  FD_LOG_NOTICE(( "test_manifest_roundtrip_blockhash_old_entry" ));
+  fd_wksp_t * wksp = mini->wksp;
+
+  ulong const base = 1000000UL;
+  ulong idxs[ 10 ];
+  idxs[ 0 ] = base;
+  for( ulong i=1UL; i<10UL; i++ ) idxs[ i ] = base+399UL+i;
+
+  fd_blockhashes_t * bhq = fd_blockhashes_init( &bank->f.block_hash_queue, 77UL );
+  FD_TEST( bhq );
+  for( ulong i=0UL; i<10UL; i++ ) {
+    fd_blockhash_info_t * info = fd_blockhash_deq_push_tail_nocopy( bhq->d.deque );
+    fd_memset( info, 0, sizeof(fd_blockhash_info_t) );
+    fd_memset( info->hash.uc, (int)(0x50+i), 32UL );
+    info->lamports_per_signature = 9000UL+i;
+    info->hash_index             = idxs[ i ];
+    fd_blockhash_map_ele_insert( bhq->map, info, bhq->d.deque );
+  }
+  FD_TEST( fd_blockhashes_age( bhq, fd_blockhash_deq_peek_head_const( bhq->d.deque ) )==408UL );
+
+  fd_epoch_credits_view_t epoch_credits_view[1];
+  FD_TEST( fd_epoch_credits_view_init( epoch_credits_view, fd_bank_epoch_credits( bank ), bank->epoch_credits_fork_id ) );
+
+  fd_ssmanifest_writer_t * writer   = test_alloc( wksp, alignof(fd_ssmanifest_writer_t), sizeof(fd_ssmanifest_writer_t) );
+  uchar *                  acc_data = test_alloc( wksp, 1UL, FD_RUNTIME_ACC_SZ_MAX );
+  fd_pubkey_t leader = {0};
+  fd_ssmanifest_writer_init( writer, bank, &leader, mini->runtime->accdb, bank->accdb_fork_id, acc_data );
+  ulong manifest_sz = writer->serialized_sz;
+  FD_TEST( manifest_sz>0UL );
+
+  uchar * buf       = test_alloc( wksp, alignof(uchar), manifest_sz );
+  uchar * chunk_buf = test_alloc( wksp, alignof(uchar), FD_SSMANIFEST_BUF_MIN );
+  ulong   written   = 0UL;
+  for(;;) {
+    ulong sz = fd_snap_manifest_serialize( writer, chunk_buf, FD_SSMANIFEST_BUF_MIN );
+    if( !sz ) break;
+    FD_TEST( written+sz<=manifest_sz );
+    memcpy( buf+written, chunk_buf, sz );
+    written += sz;
+  }
+  FD_TEST( written==manifest_sz );
+  fd_epoch_credits_view_fini( epoch_credits_view );
+
+  fd_snapshot_manifest_t * manifest = test_alloc( wksp, alignof(fd_snapshot_manifest_t), sizeof(fd_snapshot_manifest_t) );
+  memset( manifest, 0, sizeof(fd_snapshot_manifest_t) );
+  void * parser_mem = test_alloc( wksp, fd_ssmanifest_parser_align(), fd_ssmanifest_parser_footprint() );
+  fd_ssmanifest_parser_t * parser = fd_ssmanifest_parser_join( fd_ssmanifest_parser_new( parser_mem ) );
+  FD_TEST( parser );
+  fd_ssmanifest_parser_init( parser, manifest );
+  int result = fd_ssmanifest_parser_consume( parser, buf, written );
+  FD_TEST( result==FD_SSMANIFEST_PARSER_ADVANCE_DONE || result==FD_SSMANIFEST_PARSER_ADVANCE_AGAIN );
+  FD_TEST( fd_ssmanifest_parser_fini( parser )==FD_SSMANIFEST_PARSER_ADVANCE_DONE );
+
+  /* All ten entries survive, including the one at age 408, each at its
+     absolute hash_index. */
+  FD_TEST( manifest->blockhashes_len==10UL );
+  ulong seen = 0UL;
+  for( ulong j=0UL; j<manifest->blockhashes_len; j++ ) {
+    fd_snapshot_manifest_blockhash_t const * e = &manifest->blockhashes[ j ];
+    ulong i = ULONG_MAX;
+    for( ulong k=0UL; k<10UL; k++ ) if( e->hash_index==idxs[ k ] ) i = k;
+    FD_TEST( i!=ULONG_MAX );
+    FD_TEST( !( seen & (1UL<<i) ) );
+    seen |= 1UL<<i;
+    uchar expect[ 32UL ]; fd_memset( expect, (int)(0x50+i), 32UL );
+    FD_TEST( !memcmp( e->hash, expect, 32UL ) );
+    FD_TEST( e->lamports_per_signature==9000UL+i );
+  }
+  FD_TEST( seen==0x3FFUL );
+
+  fd_wksp_free_laddr( parser_mem );
 }
 
 /* The writer is too large for the stack. */
@@ -1786,8 +1979,7 @@ main( int     argc,
   params->root_slot          = ROOT_SLOT;
   params->slots_per_epoch    = 432UL;
   /* Place the bank in epoch 4 so the manifest carries every key
-     E-3..E+1 and the t_1 (epoch) and t_2 (epoch-1) collector override
-     tags are distinct. */
+     E-3..E+1 and the t_1 and t_2 sets are distinct. */
   fd_sol_sysvar_clock_t clock = { .slot = ROOT_SLOT, .epoch = 4UL, .leader_schedule_epoch = 5UL };
   params->clock              = &clock;
   ulong bank_idx = fd_svm_mini_reset( mini, params );
@@ -1795,6 +1987,10 @@ main( int     argc,
   FD_TEST( bank );
 
   test_manifest_roundtrip( mini, bank );
+  test_allocs_reclaim( wksp );
+  test_manifest_roundtrip_blockhash_holes( mini, bank );
+  test_allocs_reclaim( wksp );
+  test_manifest_roundtrip_blockhash_old_entry( mini, bank );
   test_allocs_reclaim( wksp );
   test_txncache_writer_arena_sz();
   test_txncache_roundtrip_empty( wksp );

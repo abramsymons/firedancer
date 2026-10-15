@@ -115,7 +115,7 @@ fd_keyguard_bls_key_derive( fd_keyguard_bls_key_t * key,
 
   fd_bls_pub_t public_key[1];
   fd_bls_sec_to_pub( &key->secret_key, public_key );
-  blst_p1_compress( key->public_key, public_key );
+  blst_p1_affine_compress( key->public_key, public_key );
 }
 
 static void FD_FN_SENSITIVE
@@ -195,7 +195,7 @@ during_housekeeping( fd_sign_ctx_t * ctx ) {
 
 static inline void
 metrics_write( fd_sign_ctx_t * ctx ) {
-  FD_MHIST_COPY( SIGN, SIGN_DURATION_SECONDS, ctx->sign_duration );
+  FD_MHIST_COPY( SIGN, SIGN_DURATION_NANOS, ctx->sign_duration );
 }
 
 /* during_frag is called between pairs for sequence number checks, as
@@ -424,8 +424,7 @@ unprivileged_init_sensitive( fd_topo_t const *      topo,
   FD_TEST( tile->in_cnt<=MAX_IN );
   FD_TEST( tile->in_cnt==tile->out_cnt );
 
-  fd_histf_join( fd_histf_new( ctx->sign_duration, FD_MHIST_SECONDS_MIN( SIGN, SIGN_DURATION_SECONDS ),
-                                                   FD_MHIST_SECONDS_MAX( SIGN, SIGN_DURATION_SECONDS ) ) );
+  fd_histf_join( fd_metrics_histf_new_ns( ctx->sign_duration, FD_MHIST_EDGES_NS( SIGN, SIGN_DURATION_NANOS ) ) );
 
   ctx->keyswitch = fd_keyswitch_join( fd_topo_obj_laddr( topo, tile->id_keyswitch_obj_id ) );
   derive_fields( ctx );
@@ -506,12 +505,12 @@ unprivileged_init_sensitive( fd_topo_t const *      topo,
     } else if( !strcmp(in_link->name, "votor_sign" ) ) {
       ctx->in[ i ].role = FD_KEYGUARD_ROLE_VOTOR;
       FD_TEST( !strcmp( out_link->name, "sign_votor" ) );
-      FD_TEST( in_link->mtu==130UL );
+      FD_TEST( in_link->mtu==FD_KEYGUARD_SIGN_REQ_MTU );
       FD_TEST( out_link->mtu==FD_KEYGUARD_BLS_SIG_SZ );
     } else if( !strcmp(in_link->name, "tower_sign" ) ) {
       ctx->in[ i ].role = FD_KEYGUARD_ROLE_TOWER;
       FD_TEST( !strcmp( out_link->name, "sign_tower" ) );
-      FD_TEST( in_link->mtu==FD_KEYGUARD_SIGN_REQ_MTU );
+      FD_TEST( in_link->mtu==4096UL );
       FD_TEST( out_link->mtu==64UL );
     } else {
       FD_LOG_CRIT(( "unexpected link %s", in_link->name ));

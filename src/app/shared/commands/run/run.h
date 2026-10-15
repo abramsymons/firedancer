@@ -27,6 +27,15 @@ void
 initialize_accdb_fd( config_t const * config );
 
 void
+initialize_epoch_credits_fd( config_t const * config );
+
+void
+initialize_cost_tracker_fd( config_t const * config );
+
+void
+initialize_vote_stakes_fd( config_t const * config );
+
+void
 initialize_stake_delegations_fd( config_t const * config );
 
 void

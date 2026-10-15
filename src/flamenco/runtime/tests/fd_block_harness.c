@@ -7,6 +7,7 @@
 #include "../fd_system_ids.h"
 #include "../fd_runtime_stack_tmpl.h"
 #include "../../stakes/fd_stake_types.h"
+#include "../program/vote/fd_vote_codec.h"
 #include "../sysvar/fd_sysvar_epoch_schedule.h"
 #include "../../progcache/fd_progcache_admin.h"
 #include "../../log_collector/fd_log_collector.h"
@@ -66,41 +67,25 @@ fd_solfuzz_block_update_prev_epoch_stakes( fd_vote_stakes_t *                 vo
       commission = (ushort)( (uchar)( vote_accounts[i].commission_bps / 100U ) * 100U );
     }
 
-    uchar const no_bls[ FD_BLS_PUBKEY_COMPRESSED_SZ ] = {0};
-    if( use_t_1 ) fd_vote_stakes_snap_insert_t_1( vote_stakes, vote_stakes_fork_id, &vote_pubkey, &node_pubkey, stake, commission, no_bls );
-    else          fd_vote_stakes_snap_insert_t_2( vote_stakes, vote_stakes_fork_id, &vote_pubkey, &node_pubkey, stake, commission, no_bls );
-  }
-}
-
-/* Restores SIMD-0232 collector overrides from the t_1/t_2 vote account
-   snapshots into the bank's collector override store.  Mirrors the
-   snapshot-load logic in fd_ssload.c: only non-default collectors get
-   entries (default inflation collector is the vote pubkey, default
-   block revenue collector is the node identity).  t_1 entries are
-   tagged with the bank epoch and t_2 entries with epoch-1 (the leader
-   schedule source state).  Collectors only exist in V4 vote state, so
-   entries with other versions are skipped (Agave likewise only honors
-   collectors for V4 snapshots). */
-static void
-fd_solfuzz_block_restore_collector_overrides( fd_collector_overrides_t *               overrides,
-                                              ushort                                   fork_idx,
-                                              fd_exec_test_prev_vote_account_t const * vote_accounts,
-                                              pb_size_t                                vote_accounts_cnt,
-                                              ulong                                    epoch ) {
-  if( FD_UNLIKELY( !vote_accounts ) ) return;
-
-  for( uint i=0U; i<vote_accounts_cnt; i++ ) {
-    fd_exec_test_prev_vote_account_t const * va = &vote_accounts[i];
-    if( va->version!=FD_EXEC_TEST_VOTE_ACCOUNT_VERSION_V4 ) continue;
-    int has_inflation = ( va->inflation_rewards_collector.size==32U ) &&
-                        !!memcmp( va->inflation_rewards_collector.bytes, va->address, 32UL );
-    int has_block     = ( va->block_revenue_collector.size==32U ) &&
-                        !!memcmp( va->block_revenue_collector.bytes, va->node_pubkey, 32UL );
-    if( FD_UNLIKELY( has_inflation | has_block ) ) {
-      fd_collector_overrides_upsert( overrides, fork_idx, epoch, (fd_pubkey_t const *)va->address,
-                                     has_inflation, (fd_pubkey_t const *)va->inflation_rewards_collector.bytes,
-                                     has_block, (fd_pubkey_t const *)va->block_revenue_collector.bytes );
+    /* SIMD-0123 fields exist in v4 state only; older versions keep the
+       100% default and no pending rewards. */
+    ushort              block_revenue_commission_bps = FD_VOTE_DEFAULT_BLOCK_REVENUE_COMMISSION_BPS;
+    ulong               pending_delegator_rewards    = 0UL;
+    fd_pubkey_t const * inflation_collector          = NULL;
+    fd_pubkey_t const * block_collector              = NULL;
+    if( vote_accounts[i].version == FD_EXEC_TEST_VOTE_ACCOUNT_VERSION_V4 ) {
+      block_revenue_commission_bps = (ushort)vote_accounts[i].block_revenue_commission_bps;
+      pending_delegator_rewards    = vote_accounts[i].pending_delegator_rewards;
+      /* SIMD-0232 collectors; empty fields keep the vote/node defaults. */
+      if( vote_accounts[i].inflation_rewards_collector.size==32U ) inflation_collector = (fd_pubkey_t const *)vote_accounts[i].inflation_rewards_collector.bytes;
+      if( vote_accounts[i].block_revenue_collector.size    ==32U ) block_collector     = (fd_pubkey_t const *)vote_accounts[i].block_revenue_collector.bytes;
     }
+
+    uchar const no_bls[ FD_BLS_PUBKEY_COMPRESSED_SZ ] = {0};
+    if( use_t_1 ) fd_vote_stakes_snap_insert_t_1( vote_stakes, vote_stakes_fork_id, &vote_pubkey, &node_pubkey, stake, commission, no_bls,
+                                                  block_revenue_commission_bps, pending_delegator_rewards, inflation_collector, block_collector );
+    else          fd_vote_stakes_snap_insert_t_2( vote_stakes, vote_stakes_fork_id, &vote_pubkey, &node_pubkey, stake, commission, no_bls,
+                                                  block_revenue_commission_bps, pending_delegator_rewards, inflation_collector, block_collector );
   }
 }
 
@@ -310,17 +295,6 @@ fd_solfuzz_pb_block_ctx_create( fd_solfuzz_runner_t *                runner,
   fd_vote_stakes_refresh( vote_stakes, parent->vote_stakes_fork_id, accdb, fork_id );
   bank->vote_stakes_fork_id = fd_vote_stakes_new_fork( vote_stakes, parent->vote_stakes_fork_id, bank->f.epoch );
 
-  /* SIMD-0232 collector overrides from the t_1/t_2 vote account
-     snapshots.  The override store was reset (and the bank's fork id
-     assigned) by fd_banks_clear_bank above. */
-  fd_collector_overrides_t * collector_overrides = fd_bank_collector_overrides( bank );
-  fd_solfuzz_block_restore_collector_overrides( collector_overrides, bank->collector_overrides_fork_id,
-                                                block_bank->vote_accounts_t_1, block_bank->vote_accounts_t_1_count,
-                                                bank->f.epoch );
-  fd_solfuzz_block_restore_collector_overrides( collector_overrides, bank->collector_overrides_fork_id,
-                                                block_bank->vote_accounts_t_2, block_bank->vote_accounts_t_2_count,
-                                                fd_ulong_sat_sub( bank->f.epoch, 1UL ) );
-
   /* Initialize total_effective/activating/deactivating_stake from the
      loaded stake delegations.  These are read by fd_stakes_activate_epoch
      at epoch boundary instead of re-scanning all delegations. */
@@ -336,25 +310,30 @@ fd_solfuzz_pb_block_ctx_create( fd_solfuzz_runner_t *                runner,
   /* Use epoch_credits from the proto if available (captured at epoch
      boundary time), otherwise fall back to the vote account in accdb. */
   ulong epoch_credits_len = 0UL;
+  fd_epoch_credits_view_t epoch_credits_view[1];
+  FD_TEST( fd_epoch_credits_view_init( epoch_credits_view, fd_bank_epoch_credits( bank ), bank->epoch_credits_fork_id ) );
   for( uint i=0U; i<block_bank->vote_accounts_t_1_count; i++ ) {
     fd_exec_test_prev_vote_account_t const * prev_vote_accs = &block_bank->vote_accounts_t_1[i];
 
-    if( FD_UNLIKELY( !fd_vote_stakes_query_t_1( vote_stakes, bank->vote_stakes_fork_id, (fd_pubkey_t const *)prev_vote_accs->address,
-                                                NULL, NULL, NULL ) ) ) continue;
+    if( FD_UNLIKELY( !fd_vote_stakes_query_t_1( vote_stakes, bank->vote_stakes_fork_id, (fd_pubkey_t const *)prev_vote_accs->address, NULL ) ) ) continue;
 
     FD_TEST( prev_vote_accs->epoch_credits_count<=FD_EPOCH_CREDITS_MAX );
-    fd_epoch_credits_t * ec = &fd_bank_epoch_credits( bank )[epoch_credits_len++];
+    fd_epoch_credits_t * ec = &epoch_credits_view->credits[epoch_credits_len++];
     fd_memcpy( ec->pubkey, prev_vote_accs->address, sizeof(fd_pubkey_t) );
 
     /* Alpenglow migration markers are not credits records: skip them so
        base_credits comes from the first real entry (subtracting a
        ULONG_MAX base would underflow every delta) and cnt counts only
        real entries.  Mirrors fd_ssload.c / get_vote_credits(). */
-    ulong cnt        = 0UL;
-    ec->base_credits = 0UL;
+    ulong cnt                   = 0UL;
+    ec->base_credits            = 0UL;
+    ec->has_ag_migration_marker = 0;
     for( ulong j=0UL; j<prev_vote_accs->epoch_credits_count; j++ ) {
       fd_exec_test_epoch_credit_t const * epc = &prev_vote_accs->epoch_credits[j];
-      if( FD_UNLIKELY( fd_solfuzz_epoch_credit_is_alpenglow_marker( epc ) ) ) continue;
+      if( FD_UNLIKELY( fd_solfuzz_epoch_credit_is_alpenglow_marker( epc ) ) ) {
+        ec->has_ag_migration_marker = 1;
+        continue;
+      }
       if( FD_UNLIKELY( !cnt ) ) ec->base_credits = epc->prev_credits;
       ec->epoch[ cnt ]              = (ushort)epc->epoch;
       ec->credits_delta[ cnt ]      = epc->credits      - ec->base_credits;
@@ -364,7 +343,8 @@ fd_solfuzz_pb_block_ctx_create( fd_solfuzz_runner_t *                runner,
     ec->cnt          = (uchar)cnt; /* <=FD_EPOCH_CREDITS_MAX tested above */
     ec->fast_path_ok = fd_epoch_credits_fast_path_ok( ec );
   }
-  *fd_bank_epoch_credits_len( bank ) = epoch_credits_len;
+  epoch_credits_view->len = epoch_credits_len;
+  fd_epoch_credits_view_fini( epoch_credits_view );
 
   /* Update leader schedule */
   fd_runtime_update_leaders( bank, runtime_stack );
@@ -486,7 +466,7 @@ fd_solfuzz_block_ctx_exec( fd_solfuzz_runner_t * runner,
        updated in the blockhash queue. */
     runner->bank->f.poh = *poh;
     /* Finalize the block */
-    fd_runtime_block_execute_finalize( runner->bank, runner->accdb, capture_ctx, NULL, (ushort)0 );
+    fd_runtime_block_execute_finalize( runner->bank, runner->accdb, capture_ctx, NULL, (ushort)0, NULL );
 
     return !has_err;
   } FD_SPAD_FRAME_END;
@@ -680,7 +660,7 @@ fd_solfuzz_pb_block_run( fd_solfuzz_runner_t * runner,
     fd_memcpy( effects->bank_hash, bank_hash.hash, sizeof(fd_hash_t) );
 
     /* Capture cost tracker */
-    fd_cost_tracker_t const * cost_tracker = fd_bank_cost_tracker_query( runner->bank );
+    fd_cost_tracker_t const * cost_tracker = fd_cost_tracker_store_peek( fd_bank_cost_tracker( runner->bank ), runner->bank->cost_tracker_fork_id );
     effects->has_cost_tracker = 1;
     effects->cost_tracker = (fd_exec_test_cost_tracker_t) {
       .block_cost = cost_tracker ? cost_tracker->block_cost : 0UL,

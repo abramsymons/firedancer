@@ -360,7 +360,7 @@ struct fd_event_block_completed {
   ulong                                 progcache_fork_id;                         /* Program cache fork handle held by the bank. See bank_idx for scope. */
   ushort                                accdb_fork_id;                             /* Account database fork handle held by the bank. See bank_idx for scope. */
   ulong                                 vote_stakes_fork_id;                       /* Vote stakes fork handle held by the bank. See bank_idx for scope. */
-  ushort                                collector_overrides_fork_id;               /* Collector overrides fork handle held by the bank. See bank_idx for scope. */
+  ushort                                collector_overrides_fork_id;               /* Deprecated collector overrides fork handle. Always 0. */
   ushort                                stake_rewards_fork_id;                     /* Stake rewards fork handle held by the bank. See bank_idx for scope. */
   ushort                                epoch_credits_fork_id;                     /* Epoch credits fork handle held by the bank. See bank_idx for scope. */
   ushort                                stake_delegations_fork_id;                 /* Stake delegations fork handle held by the bank. See bank_idx for scope. */
@@ -801,15 +801,16 @@ typedef struct fd_event_runtime_vote_account fd_event_runtime_vote_account_t;
 #define FD_EVENT_ALPENGLOW_VOTE_KIND_SKIP_FALLBACK  (5) /* Cast on SafeToSkip. Names only the slot. */
 
 /* Why we cast the vote, based on the Alpenglow voting algorithm (not_our_vote if it is not ours). References: Algorithms 1 and 2, Definitions 15, 16 and 17. */
-#define FD_EVENT_ALPENGLOW_VOTE_REASON_NOT_OUR_VOTE    (1) /* Not our vote; see our_vote. */
-#define FD_EVENT_ALPENGLOW_VOTE_REASON_BLOCK_REPLAYED  (2) /* Replay completed the block normally, so we vote notar for it. */
-#define FD_EVENT_ALPENGLOW_VOTE_REASON_PARENT_READY    (3) /* We hold the certs that make a block a valid parent for the leader window starting at this slot (a notar, notar-fallback or fast-final cert for it, or it is finalized, and skip certs for every slot in between), so we vote notar for the window's first block we held pending. */
-#define FD_EVENT_ALPENGLOW_VOTE_REASON_BLOCK_NOTARIZED (4) /* We hold a notar cert for the block we voted notar for and cast no skip or fallback vote in the slot, so we vote final for it. */
-#define FD_EVENT_ALPENGLOW_VOTE_REASON_TIMEOUT         (5) /* The slot's timeout fired with no vote cast in it, so we vote skip on the entire rest of the window containing this slot. */
-#define FD_EVENT_ALPENGLOW_VOTE_REASON_SAFE_TO_NOTAR   (6) /* No block but this one can be fast-finalized in the slot: notar votes for it reach 40% of stake, or 20% with skip votes bringing the total to 60%, and its parent is notar-fallback certified (Definition 16). Having voted skip or notar for another block in the slot, we vote notar-fallback for it and skip every unvoted slot of the window. */
-#define FD_EVENT_ALPENGLOW_VOTE_REASON_SAFE_TO_SKIP    (7) /* No block can be fast-finalized in the slot: skip votes plus notar votes for every block but the most-voted one reach 40% of stake (Definition 16). Having voted notar in the slot, we vote skip-fallback for it and skip every unvoted slot of the window. */
-#define FD_EVENT_ALPENGLOW_VOTE_REASON_REWARD          (8) /* Our notar or skip vote sent to the leader of slot+8, who packs the slot's reward cert, apart from the broadcast, and resent every probe timeout until that leader acknowledges it or we replay slot+8. */
-#define FD_EVENT_ALPENGLOW_VOTE_REASON_REWARD_ACKED    (9) /* The leader of slot+8 acknowledged a packet carrying our notar or skip vote, which ends its reward resends. The row timestamp is when the acknowledgement arrived; broadcast_to is empty. */
+#define FD_EVENT_ALPENGLOW_VOTE_REASON_NOT_OUR_VOTE         (1) /* Not our vote; see our_vote. */
+#define FD_EVENT_ALPENGLOW_VOTE_REASON_BLOCK_REPLAYED       (2) /* Replay completed the block normally, so we vote notar for it. */
+#define FD_EVENT_ALPENGLOW_VOTE_REASON_PARENT_READY         (3) /* We hold the certs that make a block a valid parent for the leader window starting at this slot (a notar, notar-fallback or fast-final cert for it, or it is finalized, and skip certs for every slot in between), so we vote notar for the window's first block we held pending. */
+#define FD_EVENT_ALPENGLOW_VOTE_REASON_BLOCK_NOTARIZED      (4) /* We hold a notar cert for the block we voted notar for and cast no skip or fallback vote in the slot, so we vote final for it. */
+#define FD_EVENT_ALPENGLOW_VOTE_REASON_TIMEOUT              (5) /* The slot's timeout fired with no vote cast in it, so we vote skip on the entire rest of the window containing this slot. */
+#define FD_EVENT_ALPENGLOW_VOTE_REASON_SAFE_TO_NOTAR        (6) /* No block but this one can be fast-finalized in the slot: notar votes for it reach 40% of stake, or 20% with skip votes bringing the total to 60%, and its parent is notar-fallback certified (Definition 16). Having voted skip or notar for another block in the slot, we vote notar-fallback for it and skip every unvoted slot of the window. */
+#define FD_EVENT_ALPENGLOW_VOTE_REASON_SAFE_TO_SKIP         (7) /* No block can be fast-finalized in the slot: skip votes plus notar votes for every block but the most-voted one reach 40% of stake (Definition 16). Having voted notar in the slot, we vote skip-fallback for it and skip every unvoted slot of the window. */
+#define FD_EVENT_ALPENGLOW_VOTE_REASON_REWARD               (8) /* Our notar or skip vote sent to the leader of slot+8, who packs the slot's reward cert, apart from the broadcast, and resent every probe timeout until that leader acknowledges it or we replay slot+8. */
+#define FD_EVENT_ALPENGLOW_VOTE_REASON_REWARD_ACKED         (9) /* The leader of slot+8 acknowledged a packet carrying our notar or skip vote, which ends its reward resends. The row timestamp is when the acknowledgement arrived; broadcast_to is empty. */
+#define FD_EVENT_ALPENGLOW_VOTE_REASON_REWARD_NO_CONNECTION (10) /* We are trying to cast a notar or skip vote whose reward (slot+8) leader we have no active connection to. The problematic gossip ip and port is in broadcast_to. */
 
 /* What we did with the vote. unknown_peer and banned_peer are decided on the connection before the vote is decoded, shred_version_mismatch and unranked_peer after decoding, in that order; the rest are Alpenglow-specific validation. */
 #define FD_EVENT_ALPENGLOW_VOTE_PROCESSING_RESULT_UNKNOWN_PEER           (1) /* The connection had no known peer: we cleared its identity while closing it, or accepted it before we knew the epoch's validators. */
@@ -948,12 +949,13 @@ fd_event_alpenglow_cert_footprint( fd_event_alpenglow_cert_t const * msg ) {
 #define FD_EVENT_ALPENGLOW_CERT_BUF_MAX (176828UL)
 
 /* The reason the block was no longer attempted to be repaired. */
-#define FD_EVENT_BLOCK_RECEIVED_CANCELLED_REASON_NOT_CANCELLED        (1) /* Not cancelled. */
-#define FD_EVENT_BLOCK_RECEIVED_CANCELLED_REASON_MERKLE_ROOT_MISMATCH (2) /* Received two merkle roots for the same FEC set. */
-#define FD_EVENT_BLOCK_RECEIVED_CANCELLED_REASON_NOTARIZED_VERSION    (3) /* A verified version of the block became known. */
-#define FD_EVENT_BLOCK_RECEIVED_CANCELLED_REASON_VERIFIED_PARENT      (4) /* A verified version of a verified block's parent became known. */
-#define FD_EVENT_BLOCK_RECEIVED_CANCELLED_REASON_PARENT_OFF_MISMATCH  (5) /* A data shred's parent_off disagreed with the slot's other shreds or with its block header. */
-#define FD_EVENT_BLOCK_RECEIVED_CANCELLED_REASON_INVALID_BLOCK_HEADER (6) /* Shred 0 did not carry a valid block header. */
+#define FD_EVENT_BLOCK_RECEIVED_CANCELLED_REASON_NOT_CANCELLED          (1) /* Not cancelled. */
+#define FD_EVENT_BLOCK_RECEIVED_CANCELLED_REASON_MERKLE_ROOT_MISMATCH   (2) /* Received two merkle roots for the same FEC set. */
+#define FD_EVENT_BLOCK_RECEIVED_CANCELLED_REASON_NOTARIZED_VERSION      (3) /* A verified version of the block became known. */
+#define FD_EVENT_BLOCK_RECEIVED_CANCELLED_REASON_VERIFIED_PARENT        (4) /* A verified version of a verified block's parent became known. */
+#define FD_EVENT_BLOCK_RECEIVED_CANCELLED_REASON_PARENT_OFF_MISMATCH    (5) /* A data shred's parent_off disagreed with the slot's other shreds or with its block header. */
+#define FD_EVENT_BLOCK_RECEIVED_CANCELLED_REASON_INVALID_BLOCK_HEADER   (6) /* Shred 0 did not carry a valid block header. */
+#define FD_EVENT_BLOCK_RECEIVED_CANCELLED_REASON_SLOT_COMPLETE_MISMATCH (7) /* A data shred's slot complete flag disagreed with the slot's other shreds. */
 
 /* The source of the final shred that completed the FEC set. */
 #define FD_EVENT_BLOCK_RECEIVED_FEC_SETS_FINAL_SHRED_SOURCE_TURBINE (1) /* Received via turbine. */

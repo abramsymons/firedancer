@@ -62,6 +62,27 @@ main( int     argc,
                                  "%s/stakedelegations.db",
                                  config->paths.base ) );
   FD_TEST( !strcmp( config->paths.stake_delegations, expected_stake_delegations ) );
+  char expected_epoch_credits[ PATH_MAX ];
+  FD_TEST( fd_cstr_printf_check( expected_epoch_credits,
+                                 sizeof(expected_epoch_credits),
+                                 NULL,
+                                 "%s/epochcredits.db",
+                                 config->paths.base ) );
+  FD_TEST( !strcmp( config->paths.epoch_credits, expected_epoch_credits ) );
+  char expected_cost_tracker[ PATH_MAX ];
+  FD_TEST( fd_cstr_printf_check( expected_cost_tracker,
+                                 sizeof(expected_cost_tracker),
+                                 NULL,
+                                 "%s/costtracker.db",
+                                 config->paths.base ) );
+  FD_TEST( !strcmp( config->paths.cost_tracker, expected_cost_tracker ) );
+  char expected_vote_stakes[ PATH_MAX ];
+  FD_TEST( fd_cstr_printf_check( expected_vote_stakes,
+                                 sizeof(expected_vote_stakes),
+                                 NULL,
+                                 "%s/votestakes.db",
+                                 config->paths.base ) );
+  FD_TEST( !strcmp( config->paths.vote_stakes, expected_vote_stakes ) );
 
   strcpy( config->tiles.bundle.url, "https://user:hunter2@mainnet.example.com:443/v1/txns?api-key=SECRET#frag" );
   strcpy( config->tiles.event.url,  "https://events.example.com/submit" );

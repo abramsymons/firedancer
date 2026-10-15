@@ -16,6 +16,7 @@
 
 #include "../runtime/fd_bank.h"
 #include "fd_block_marker.h"
+#include "fd_footer_cache.h"
 
 FD_PROTOTYPES_BEGIN
 
@@ -57,17 +58,57 @@ fd_alpenglow_migration_slot( fd_bank_t *  bank,
 int
 fd_alpenglow_footer_verify( fd_bank_t const *         bank,
                             fd_block_footer_t const * footer,
-                            ushort                    shred_version );
+                            ushort                    shred_version,
+                            fd_footer_cache_t *       cache );
+
+#define FD_ALPENGLOW_FOOTER_CERT_MAX (5UL)
+
+/* fd_alpenglow_footer_certs lists the certs fd_alpenglow_footer_verify
+   checks, in its order, with the vote tag and quorum numerator each is
+   checked against.  Returns the count. */
+
+ulong
+fd_alpenglow_footer_certs( fd_block_footer_t const *      footer,
+                           fd_block_footer_cert_t const * cert  [ static FD_ALPENGLOW_FOOTER_CERT_MAX ],
+                           uint                           tag   [ static FD_ALPENGLOW_FOOTER_CERT_MAX ],
+                           ulong                          quorum[ static FD_ALPENGLOW_FOOTER_CERT_MAX ] );
+
+#define FD_ALPENGLOW_CERT_PAYLOAD_MAX (43UL)
+
+ulong
+fd_alpenglow_cert_payload( fd_block_footer_cert_t const * cert,
+                           uint                           vote_tag,
+                           ushort                         shred_version,
+                           uchar                          payload[ static FD_ALPENGLOW_CERT_PAYLOAD_MAX ] );
+
+/* fd_alpenglow_cert_verify checks one cert listed by
+   fd_alpenglow_footer_certs.  A footer with certs verifies iff each of
+   its certs does.  cache may be NULL.  hm (NULL for none) is the
+   payload's H(m), skipping its lookup.  hm_out (NULL for none) is set
+   to H(m) when hm is NULL.  Returns 0 if the cert verifies
+   and -1 otherwise, including when shred_version is 0. */
+
+int
+fd_alpenglow_cert_verify( fd_bank_t const *              bank,
+                          fd_block_footer_cert_t const * cert,
+                          uint                           vote_tag,
+                          ulong                          quorum_numer,
+                          ushort                         shred_version,
+                          fd_footer_cache_t *            cache,
+                          blst_p2_affine const *         hm,
+                          blst_p2_affine *               hm_out );
 
 /* fd_alpenglow_rewards_apply applies the side effects of the footer's
    certs to the bank's accounts.  Only the slot and signer bitmap of
-   each cert are read; the signatures are not verified here.
-   Returns 0 on success and -1 if processing of the bank should fail */
+   each cert are read; the signatures are not verified here.  cache
+   must not be NULL.  Returns 0 on success and -1 if processing of the
+   bank should fail */
 
 int
 fd_alpenglow_rewards_apply( fd_bank_t *               bank,
                             fd_accdb_t *              accdb,
                             fd_capture_ctx_t *        capture_ctx,
+                            fd_footer_cache_t *       cache,
                             fd_block_footer_t const * footer );
 
 FD_PROTOTYPES_END

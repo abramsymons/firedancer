@@ -100,6 +100,7 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   l = FD_LAYOUT_APPEND( l, alignof(struct cmsghdr),     STEM_BURST*FD_SOCK_CMSG_MAX           );
   l = FD_LAYOUT_APPEND( l, alignof(struct sockaddr_in), STEM_BURST*sizeof(struct sockaddr_in) );
   l = FD_LAYOUT_APPEND( l, alignof(struct mmsghdr),     STEM_BURST*sizeof(struct mmsghdr)     );
+  l = FD_LAYOUT_APPEND( l, alignof(ulong),              STEM_BURST*sizeof(ulong)              );
   if( !tile->sock.only_recv_lo ) l = FD_LAYOUT_APPEND( l, FD_CHUNK_ALIGN, tx_scratch_footprint() );
   return FD_LAYOUT_FINI( l, scratch_align() );
 }
@@ -188,6 +189,7 @@ privileged_init( fd_topo_t const *      topo,
   void *               batch_cmsg = FD_SCRATCH_ALLOC_APPEND( l, alignof(struct cmsghdr),     STEM_BURST*FD_SOCK_CMSG_MAX           );
   struct sockaddr_in * batch_sa   = FD_SCRATCH_ALLOC_APPEND( l, alignof(struct sockaddr_in), STEM_BURST*sizeof(struct sockaddr_in) );
   struct mmsghdr *     batch_msg  = FD_SCRATCH_ALLOC_APPEND( l, alignof(struct mmsghdr),     STEM_BURST*sizeof(struct mmsghdr)     );
+  ulong *              batch_fsz  = FD_SCRATCH_ALLOC_APPEND( l, alignof(ulong),              STEM_BURST*sizeof(ulong)              );
   ulong                tx_sz      = tile->sock.only_recv_lo ? 0UL : tx_scratch_footprint();
   uchar *              tx_scratch = FD_SCRATCH_ALLOC_APPEND( l, FD_CHUNK_ALIGN,              tx_sz );
   FD_DCHECK_CRIT( scratch==ctx, "invalid layout" );
@@ -202,12 +204,14 @@ privileged_init( fd_topo_t const *      topo,
   ctx->batch_cmsg  = batch_cmsg;
   ctx->batch_sa    = batch_sa;
   ctx->batch_msg   = batch_msg;
+  ctx->batch_frame_sz = batch_fsz;
   ctx->tx_scratch0 = tx_scratch;
   ctx->tx_scratch1 = tx_scratch + tx_sz;
   ctx->tx_ptr      = tx_scratch;
   ctx->repair_shred_sock_idx = UINT_MAX;
   ctx->tx_sock = -1;
   ctx->bind_address = tile->sock.net.bind_address;
+  ctx->tick_per_ns  = fd_tempo_tick_per_ns( NULL );
   if( tile->sock.only_recv_lo ) {
     ctx->lo_ifindex = if_nametoindex( "lo" );
     if( FD_UNLIKELY( !ctx->lo_ifindex ) ) {
@@ -507,9 +511,11 @@ poll_rx( fd_sock_tile_t *    ctx,
     FD_LOG_ERR(( "Batch is not clean" ));
   }
   ctx->tx_idle_cnt = 0; /* restart TX polling */
-  if( FD_UNLIKELY( fd_syscall_poll( ctx->pollfd, ctx->sock_cnt, ctx->lo_ifindex ? -1 : 0 )<0 ) ) {
+  long wait_ns = ctx->lo_ifindex ? (long)((double)fd_long_max( stem->then-fd_tickcount(), 0L )/ctx->tick_per_ns) : 0L;
+  struct timespec ts = { .tv_sec = wait_ns/1000000000L, .tv_nsec = wait_ns%1000000000L };
+  if( FD_UNLIKELY( ppoll( ctx->pollfd, ctx->sock_cnt, &ts, NULL )<0 ) ) {
     if( FD_UNLIKELY( errno==EINTR ) ) return 0UL;
-    FD_LOG_ERR(( "fd_syscall_poll failed (%i-%s)", errno, fd_io_strerror( errno ) ));
+    FD_LOG_ERR(( "ppoll failed (%i-%s)", errno, fd_io_strerror( errno ) ));
   }
   for( uint j=0U; j<ctx->sock_cnt; j++ ) {
     if( ctx->pollfd[ j ].revents & (POLLIN|POLLERR) ) {
@@ -535,7 +541,7 @@ flush_tx_batch( fd_sock_tile_t * ctx ) {
     int remain   = (int)batch_cnt - j;
     int send_cnt = sendmmsg( ctx->tx_sock, ctx->batch_msg + j, (uint)remain, MSG_DONTWAIT );
     if( send_cnt>=0 ) {
-      ctx->metrics.sys_sendmmsg_cnt[ FD_METRICS_ENUM_SOCKET_ERROR_V_NO_ERROR_IDX ]++;
+      ctx->metrics.sys_sendmmsg_cnt[ FD_METRICS_ENUM_SENDMMSG_RESULT_V_SUCCESS_IDX ]++;
     }
     if( FD_UNLIKELY( send_cnt < remain ) ) {
       ctx->metrics.tx_drop_cnt++;
@@ -543,22 +549,22 @@ flush_tx_batch( fd_sock_tile_t * ctx ) {
         switch( errno ) {
         case EAGAIN:
         case ENOBUFS:
-          ctx->metrics.sys_sendmmsg_cnt[ FD_METRICS_ENUM_SOCKET_ERROR_V_SLOW_IDX ]++;
+          ctx->metrics.sys_sendmmsg_cnt[ FD_METRICS_ENUM_SENDMMSG_RESULT_V_BUFFER_FULL_IDX ]++;
           break;
         case EPERM:
-          ctx->metrics.sys_sendmmsg_cnt[ FD_METRICS_ENUM_SOCKET_ERROR_V_PERMISSION_IDX ]++;
+          ctx->metrics.sys_sendmmsg_cnt[ FD_METRICS_ENUM_SENDMMSG_RESULT_V_PERMISSION_IDX ]++;
           break;
         case ENETUNREACH:
         case EHOSTUNREACH:
-          ctx->metrics.sys_sendmmsg_cnt[ FD_METRICS_ENUM_SOCKET_ERROR_V_UNREACHABLE_IDX ]++;
+          ctx->metrics.sys_sendmmsg_cnt[ FD_METRICS_ENUM_SENDMMSG_RESULT_V_UNREACHABLE_IDX ]++;
           break;
         case ENONET:
         case ENETDOWN:
         case EHOSTDOWN:
-          ctx->metrics.sys_sendmmsg_cnt[ FD_METRICS_ENUM_SOCKET_ERROR_V_DOWN_IDX ]++;
+          ctx->metrics.sys_sendmmsg_cnt[ FD_METRICS_ENUM_SENDMMSG_RESULT_V_DOWN_IDX ]++;
           break;
         default:
-          ctx->metrics.sys_sendmmsg_cnt[ FD_METRICS_ENUM_SOCKET_ERROR_V_OTHER_IDX ]++;
+          ctx->metrics.sys_sendmmsg_cnt[ FD_METRICS_ENUM_SENDMMSG_RESULT_V_OTHER_IDX ]++;
           /* log with NOTICE, since flushing has a significant negative performance impact */
           FD_LOG_NOTICE(( "sendmmsg failed (%i-%s)", errno, fd_io_strerror( errno ) ));
         }
@@ -571,6 +577,7 @@ flush_tx_batch( fd_sock_tile_t * ctx ) {
 
         /* add the successful count */
         ctx->metrics.tx_pkt_cnt += (ulong)send_cnt;
+        for( int k=j-send_cnt-1; k<j-1; k++ ) ctx->metrics.tx_bytes_total += ctx->batch_frame_sz[ k ];
       }
 
       continue;
@@ -578,6 +585,7 @@ flush_tx_batch( fd_sock_tile_t * ctx ) {
 
     /* send_cnt == batch_cnt, so we sent everything */
     ctx->metrics.tx_pkt_cnt += (ulong)send_cnt;
+    for( int k=j; k<j+send_cnt; k++ ) ctx->metrics.tx_bytes_total += ctx->batch_frame_sz[ k ];
     break;
   }
 
@@ -687,7 +695,7 @@ during_frag( fd_sock_tile_t * ctx,
 
   memcpy( buf, udp_hdr, sizeof(fd_udp_hdr_t) );
   fd_memcpy( buf+sizeof(fd_udp_hdr_t), payload, payload_sz );
-  ctx->metrics.tx_bytes_total += sz;
+  ctx->batch_frame_sz[ batch_idx ] = sz;
 }
 
 /* after_frag is called when a frag was copied into a sendmmsg buffer. */
@@ -753,7 +761,7 @@ after_credit( fd_sock_tile_t *    ctx,
     /* Housekeeping cannot publish progress while the tile sleeps. */
     FD_COMPILER_MFENCE();
     metrics_write( ctx );
-    FD_MGAUGE_SET( TILE, HEARTBEAT_TIMESTAMP_NANOS, (ulong)fd_log_wallclock() );
+    FD_MGAUGE_SET( TILE, HEARTBEAT_TIME, (ulong)fd_log_wallclock() );
     for( ulong i=0UL; i<ctx->link_rx_cnt; i++ ) {
       fd_mcache_seq_update( fd_mcache_seq_laddr( stem->mcaches[ i ] ), stem->seqs[ i ] );
     }

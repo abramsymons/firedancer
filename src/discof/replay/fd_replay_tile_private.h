@@ -18,6 +18,7 @@
 #include "../../flamenco/genesis/fd_genesis_parse.h"
 #include "../../flamenco/leaders/fd_multi_epoch_leaders.h"
 #include "../../flamenco/progcache/fd_progcache.h"
+#include "../../flamenco/alpenglow/fd_alpenglow.h"
 #include "../../flamenco/runtime/fd_bank.h"
 #include "../../flamenco/runtime/fd_txncache.h"
 #include "../../flamenco/runtime/tests/fd_dump_pb.h"
@@ -406,6 +407,7 @@ struct fd_replay_tile {
   ulong               block_id_len;
   ulong               max_live_slots;
   fd_block_id_ele_t * block_id_arr;
+  ulong *             dead_idxs; /* max_live_slots scratch for mark_bank_dead */
 
   fd_hash_t *         fec_chain;
   ulong               block_id_map_seed;
@@ -539,6 +541,10 @@ struct fd_replay_tile {
   ulong ag_last_settled;     /* highest settled slot observed */
   ulong ag_stamp_since;      /* first slot stamped into an empty table */
 
+  /* Signing payload of each exec tile's footer cert verify task */
+  uchar cert_payload   [ FD_SCHED_MAX_EXEC_TILE_CNT ][ FD_ALPENGLOW_CERT_PAYLOAD_MAX ];
+  ulong cert_payload_sz[ FD_SCHED_MAX_EXEC_TILE_CNT ];
+
   fd_keyswitch_t * keyswitch;
   int              halt_replay;
 
@@ -553,6 +559,7 @@ struct fd_replay_tile {
   fd_replay_out_link_t replay_out[1];
   ulong const *        replay_out_seq;
   fd_replay_out_link_t slot_out[1];
+  fd_replay_out_link_t rotor_out[1]; /* REPLAY_SIG_MISSING_FEC, alpenglow only */
   ulong const *        slot_out_seq;
   fd_replay_out_link_t snapmk_out[1];
   ulong admin_out_idx;
@@ -590,14 +597,13 @@ struct fd_replay_tile {
     ulong snap_finished_full;
     ulong snap_finished_incr;
     ulong snap_produced_incr_cnt;
+    fd_epoch_credits_view_t epoch_credits_view[1];
   } snapmk;
 
   struct {
     fd_histf_t store_query_work[1];
     ulong      store_query_cnt;
     ulong      store_query_missing_cnt;
-    ulong      store_query_mr;
-    ulong      store_query_missing_mr;
 
     ulong slots_total;
     ulong transactions_total;
@@ -619,6 +625,8 @@ struct fd_replay_tile {
 
   ulong                runtime_stack_seed;
   fd_runtime_stack_t * runtime_stack;
+
+  fd_footer_cache_t * footer_cache;
 
   fd_event_block_completed_t * block_completed_event;
 

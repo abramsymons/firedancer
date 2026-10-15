@@ -180,6 +180,9 @@ struct __attribute__((aligned(FD_FEC_RESOLVER_ALIGN))) fd_fec_resolver {
   ulong complete_depth;
   ulong done_depth;
 
+  /* upper bound on the slot range above the root slot */
+  ulong slot_max;
+
   /* expected_shred_version: discard all shreds with a shred version
      other than the specified value */
   ushort expected_shred_version;
@@ -325,6 +328,7 @@ fd_fec_resolver_new( void                    * shmem,
                      ulong                     partial_depth,
                      ulong                     complete_depth,
                      ulong                     done_depth,
+                     ulong                     slot_max,
                      fd_fec_set_t            * sets,
                      ulong                     seed ) {
   if( FD_UNLIKELY( (depth==0UL) | (partial_depth==0UL) | (complete_depth==0UL) | (done_depth==0UL) ) ) return NULL;
@@ -367,8 +371,7 @@ fd_fec_resolver_new( void                    * shmem,
   if( FD_UNLIKELY( !done_heap_new       ( _done_heap, done_depth                  ) ) ) { FD_LOG_WARNING(( "done_heap_new fail"     )); return NULL; }
   if( FD_UNLIKELY( !fd_ed25519_cache_new( _ed_cache, ED25519_CACHE_ENT_CNT, seed4 ) ) ) { FD_LOG_WARNING(( "ed25519_cache_new fail" )); return NULL; }
 
-  fd_histf_join( fd_histf_new( resolver->completion_lag_hist, FD_MHIST_SECONDS_MIN( SHRED, REPAIR_COMPLETION_LAG_SECONDS ),
-                                                              FD_MHIST_SECONDS_MAX( SHRED, REPAIR_COMPLETION_LAG_SECONDS ) ) );
+  fd_histf_join( fd_metrics_histf_new_ns( resolver->completion_lag_hist, FD_MHIST_EDGES_NS( SHRED, REPAIR_LEAD_DELAY_NANOS ) ) );
 
   set_ctx_t * ctx_pool = (set_ctx_t *)_ctx_pool;
   fd_memset( ctx_pool, '\0', sizeof(set_ctx_t)*depth_sum );
@@ -390,6 +393,7 @@ fd_fec_resolver_new( void                    * shmem,
   resolver->partial_depth          = partial_depth;
   resolver->complete_depth         = complete_depth;
   resolver->done_depth             = done_depth;
+  resolver->slot_max               = slot_max;
   resolver->expected_shred_version = 0;
   resolver->bypass_verify          = 0;
   resolver->free_list_cnt          = depth+partial_depth;
@@ -537,6 +541,7 @@ fd_fec_resolver_add_shred( fd_fec_resolver_t         * resolver,
   /* Is this shred for a slot we've already rooted or otherwise don't
      care about? */
   if( FD_UNLIKELY( shred->slot<resolver->slot_old ) ) return FD_FEC_RESOLVER_SHRED_IGNORED;
+  if( FD_UNLIKELY( resolver->slot_max && shred->slot>=resolver->slot_old+resolver->slot_max ) ) return FD_FEC_RESOLVER_SHRED_IGNORED;
 
   /* Do a bunch of quick validity checks */
   if( FD_UNLIKELY( shred->version!=resolver->expected_shred_version  ) ) return FD_FEC_RESOLVER_SHRED_REJECTED;
@@ -690,7 +695,7 @@ fd_fec_resolver_add_shred( fd_fec_resolver_t         * resolver,
       ctx_list_ele_push_tail ( free_list, victim_ctx, ctx_pool );
       resolver->free_list_cnt++;
 
-      FD_MCNT_INC( SHRED, FEC_SPILLED, 1UL );
+      FD_MCNT_INC( SHRED, FEC_INCOMPLETE_EVICTED, 1UL );
     }
     /* Now we know |free_list|>partial_depth */
 
@@ -712,14 +717,14 @@ fd_fec_resolver_add_shred( fd_fec_resolver_t         * resolver,
       if( FD_UNLIKELY( !rv ) ) {
         ctx_list_ele_push_head( free_list, ctx, ctx_pool );
         resolver->free_list_cnt++;
-        FD_MCNT_INC( SHRED, SHRED_INITIAL_REJECTED, 1UL );
+        FD_MCNT_INC( SHRED, INITIAL_REJECTED, 1UL );
         return FD_FEC_RESOLVER_SHRED_REJECTED;
       }
 
       if( FD_UNLIKELY( FD_ED25519_SUCCESS != fd_ed25519_verify_cached( _root->hash, 32UL, shred->signature, leader_pubkey, sha512, resolver->ed25519_cache ) ) ) {
         ctx_list_ele_push_head( free_list, ctx, ctx_pool );
         resolver->free_list_cnt++;
-        FD_MCNT_INC( SHRED, SHRED_INITIAL_REJECTED, 1UL );
+        FD_MCNT_INC( SHRED, INITIAL_REJECTED, 1UL );
         return FD_FEC_RESOLVER_SHRED_REJECTED;
       }
     }

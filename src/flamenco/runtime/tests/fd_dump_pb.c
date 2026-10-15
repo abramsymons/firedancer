@@ -8,6 +8,7 @@
 #include "../fd_bank.h"
 #include "../fd_runtime.h"
 #include "../fd_alut.h"
+#include "../sysvar/fd_sysvar_epoch_schedule.h"
 #include "../program/fd_precompiles.h"
 #include "../../../third_party/nanopb/pb_encode.h"
 #include "../fd_runtime_stack_tmpl.h"
@@ -394,25 +395,33 @@ dump_blockhash_queue( fd_bank_t *                             bank,
                       fd_spad_t *                             spad,
                       fd_exec_test_blockhash_queue_entry_t ** entries_out,
                       pb_size_t *                             count_out ) {
-  fd_blockhashes_t const * bhq      = &bank->f.block_hash_queue;
-  ulong                    bhq_size = fd_ulong_min( FD_BLOCKHASHES_MAX, fd_blockhash_deq_cnt( bhq->d.deque ) );
+  fd_blockhashes_t const * bhq   = &bank->f.block_hash_queue;
+  ulong                    total = fd_blockhash_deq_cnt( bhq->d.deque );
+
+  /* Dump the entries with age at most FD_BLOCKHASHES_MAX-1, oldest
+     first.  The deque is in ascending hash_index order, so they are a
+     suffix.  Note the protobuf has no hash_index, so a restored queue
+     gets consecutive indices: skipped indices (see fd_blockhashes.h) do
+     not survive the round trip. */
+
+  ulong to_skip = 0UL;
+  while( to_skip<total &&
+         fd_blockhashes_age( bhq, fd_blockhash_deq_peek_index_const( bhq->d.deque, to_skip ) )>FD_BLOCKHASHES_MAX-1UL ) to_skip++;
+  ulong live = total - to_skip;
 
   fd_exec_test_blockhash_queue_entry_t * entries = fd_spad_alloc( spad,
       alignof(fd_exec_test_blockhash_queue_entry_t),
-      bhq_size * sizeof(fd_exec_test_blockhash_queue_entry_t) );
+      live * sizeof(fd_exec_test_blockhash_queue_entry_t) );
 
-  ulong cnt = 0UL;
-  for( fd_blockhash_deq_iter_t iter=fd_blockhash_deq_iter_init_rev( bhq->d.deque );
-       !fd_blockhash_deq_iter_done_rev( bhq->d.deque, iter ) && cnt<bhq_size;
-       iter=fd_blockhash_deq_iter_prev( bhq->d.deque, iter ), cnt++ ) {
-    fd_blockhash_info_t const * ele   = fd_blockhash_deq_iter_ele_const( bhq->d.deque, iter );
-    fd_exec_test_blockhash_queue_entry_t * entry = &entries[bhq_size-cnt-1UL];
+  for( ulong i=0UL; i<live; i++ ) {
+    fd_blockhash_info_t const *            ele   = fd_blockhash_deq_peek_index_const( bhq->d.deque, to_skip+i );
+    fd_exec_test_blockhash_queue_entry_t * entry = &entries[ i ];
     fd_memcpy( entry->blockhash, ele->hash.uc, sizeof(fd_hash_t) );
     entry->lamports_per_signature = ele->lamports_per_signature;
   }
 
   *entries_out = entries;
-  *count_out   = (pb_size_t)bhq_size;
+  *count_out   = (pb_size_t)live;
 }
 
 static void
@@ -662,80 +671,64 @@ create_block_context_protobuf_from_block( fd_block_dump_ctx_t * dump_ctx,
   pb_size_t va_t1_cnt = 0U;
   pb_size_t va_t2_cnt = 0U;
 
-  /* SIMD-0232 collector overrides are tagged with the source epoch.
-     Empty protobuf fields represent the vote/node defaults. */
-  fd_collector_overrides_t * collector_overrides = fd_bank_collector_overrides( parent_bank );
-  ushort co_fork_idx  = parent_bank->collector_overrides_fork_id;
-  ulong  co_epoch_t_1 = parent_bank->f.epoch;
-  ulong  co_epoch_t_2 = fd_ulong_sat_sub( parent_bank->f.epoch, 1UL );
+  /* SIMD-0232 collectors: empty protobuf fields represent the vote/node
+     defaults. */
 
   for( fd_vote_stakes_iter_t * iter = fd_vote_stakes_iter_init( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_1, vote_stakes_iter_mem );
        !fd_vote_stakes_iter_done( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_1, iter );
        fd_vote_stakes_iter_next( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_1, iter ) ) {
-    fd_pubkey_t pubkey;
-    ulong       stake;
-    fd_pubkey_t node;
-    ushort      commission;
-    fd_vote_stakes_iter_ele( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_1, iter, &pubkey, &node, &stake,
-                             NULL, NULL, &commission, NULL, NULL, NULL, NULL );
-    add_account_to_dumped_accounts( dumped_accounts, &pubkey );
+    fd_vote_stakes_ele_t ele[1];
+    fd_vote_stakes_iter_ele( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_1, iter, ele );
+    add_account_to_dumped_accounts( dumped_accounts, &ele->pubkey );
 
     fd_exec_test_prev_vote_account_t * acc = &va_t1[ va_t1_cnt++ ];
-    fd_memcpy( acc->address,     &pubkey, sizeof(fd_pubkey_t) );
-    fd_memcpy( acc->node_pubkey, &node,   sizeof(fd_pubkey_t) );
-    acc->stake               = stake;
-    acc->commission_bps      = commission;
-    acc->version             = FD_EXEC_TEST_VOTE_ACCOUNT_VERSION_V4;
-    acc->epoch_credits_count = 0U;
+    fd_memcpy( acc->address,     &ele->pubkey,       sizeof(fd_pubkey_t) );
+    fd_memcpy( acc->node_pubkey, &ele->node_account, sizeof(fd_pubkey_t) );
+    acc->stake                        = ele->stake;
+    acc->commission_bps               = ele->commission;
+    acc->block_revenue_commission_bps = ele->block_revenue_commission_bps;
+    acc->pending_delegator_rewards    = ele->pending_delegator_rewards;
+    acc->version                      = FD_EXEC_TEST_VOTE_ACCOUNT_VERSION_V4;
+    acc->epoch_credits_count          = 0U;
     acc->inflation_rewards_collector.size = 0U;
     acc->block_revenue_collector.size     = 0U;
 
-    fd_pubkey_t inflation_collector;
-    fd_pubkey_t block_collector;
-    int co_flags = fd_collector_overrides_query( collector_overrides, co_fork_idx, co_epoch_t_1, &pubkey,
-                                                 &inflation_collector, &block_collector );
-    if( co_flags & FD_COLLECTOR_OVERRIDE_INFLATION ) {
+    if( !fd_pubkey_eq( &ele->inflation_collector, &ele->pubkey ) ) {
       acc->inflation_rewards_collector.size = 32U;
-      fd_memcpy( acc->inflation_rewards_collector.bytes, &inflation_collector, sizeof(fd_pubkey_t) );
+      fd_memcpy( acc->inflation_rewards_collector.bytes, &ele->inflation_collector, sizeof(fd_pubkey_t) );
     }
-    if( co_flags & FD_COLLECTOR_OVERRIDE_BLOCK ) {
+    if( !fd_pubkey_eq( &ele->block_collector, &ele->node_account ) ) {
       acc->block_revenue_collector.size = 32U;
-      fd_memcpy( acc->block_revenue_collector.bytes, &block_collector, sizeof(fd_pubkey_t) );
+      fd_memcpy( acc->block_revenue_collector.bytes, &ele->block_collector, sizeof(fd_pubkey_t) );
     }
   }
 
   for( fd_vote_stakes_iter_t * iter = fd_vote_stakes_iter_init( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_2, vote_stakes_iter_mem );
        !fd_vote_stakes_iter_done( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_2, iter );
        fd_vote_stakes_iter_next( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_2, iter ) ) {
-    fd_pubkey_t pubkey;
-    ulong       stake;
-    fd_pubkey_t node;
-    ushort      commission;
-    fd_vote_stakes_iter_ele( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_2, iter, &pubkey, &node, &stake,
-                             NULL, NULL, &commission, NULL, NULL, NULL, NULL );
-    add_account_to_dumped_accounts( dumped_accounts, &pubkey );
+    fd_vote_stakes_ele_t ele[1];
+    fd_vote_stakes_iter_ele( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_2, iter, ele );
+    add_account_to_dumped_accounts( dumped_accounts, &ele->pubkey );
 
     fd_exec_test_prev_vote_account_t * acc = &va_t2[ va_t2_cnt++ ];
-    fd_memcpy( acc->address,     &pubkey, sizeof(fd_pubkey_t) );
-    fd_memcpy( acc->node_pubkey, &node,   sizeof(fd_pubkey_t) );
-    acc->stake               = stake;
-    acc->commission_bps      = commission;
-    acc->version             = FD_EXEC_TEST_VOTE_ACCOUNT_VERSION_V4;
-    acc->epoch_credits_count = 0U;
+    fd_memcpy( acc->address,     &ele->pubkey,       sizeof(fd_pubkey_t) );
+    fd_memcpy( acc->node_pubkey, &ele->node_account, sizeof(fd_pubkey_t) );
+    acc->stake                        = ele->stake;
+    acc->commission_bps               = ele->commission;
+    acc->block_revenue_commission_bps = ele->block_revenue_commission_bps;
+    acc->pending_delegator_rewards    = ele->pending_delegator_rewards;
+    acc->version                      = FD_EXEC_TEST_VOTE_ACCOUNT_VERSION_V4;
+    acc->epoch_credits_count          = 0U;
     acc->inflation_rewards_collector.size = 0U;
     acc->block_revenue_collector.size     = 0U;
 
-    fd_pubkey_t inflation_collector;
-    fd_pubkey_t block_collector;
-    int co_flags = fd_collector_overrides_query( collector_overrides, co_fork_idx, co_epoch_t_2, &pubkey,
-                                                 &inflation_collector, &block_collector );
-    if( co_flags & FD_COLLECTOR_OVERRIDE_INFLATION ) {
+    if( !fd_pubkey_eq( &ele->inflation_collector, &ele->pubkey ) ) {
       acc->inflation_rewards_collector.size = 32U;
-      fd_memcpy( acc->inflation_rewards_collector.bytes, &inflation_collector, sizeof(fd_pubkey_t) );
+      fd_memcpy( acc->inflation_rewards_collector.bytes, &ele->inflation_collector, sizeof(fd_pubkey_t) );
     }
-    if( co_flags & FD_COLLECTOR_OVERRIDE_BLOCK ) {
+    if( !fd_pubkey_eq( &ele->block_collector, &ele->node_account ) ) {
       acc->block_revenue_collector.size = 32U;
-      fd_memcpy( acc->block_revenue_collector.bytes, &block_collector, sizeof(fd_pubkey_t) );
+      fd_memcpy( acc->block_revenue_collector.bytes, &ele->block_collector, sizeof(fd_pubkey_t) );
     }
   }
 
@@ -744,21 +737,35 @@ create_block_context_protobuf_from_block( fd_block_dump_ctx_t * dump_ctx,
      reward calculation).  Needed for the harness to correctly
      recalculate partitioned epoch rewards. */
   fd_vote_rewards_map_t * vote_ele_map = runtime_stack->stakes.vote_map;
+  ulong ag_migration_slot  = fd_alpenglow_migration_slot( parent_bank, accdb );
+  ulong ag_migration_epoch = fd_slot_to_epoch( &parent_bank->f.epoch_schedule, ag_migration_slot, NULL );
+  fd_epoch_credits_view_t epoch_credits_view[1];
+  FD_TEST( fd_epoch_credits_view_init( epoch_credits_view, fd_bank_epoch_credits( parent_bank ), parent_bank->epoch_credits_fork_id ) );
   for( pb_size_t i=0U; i<va_t1_cnt; i++ ) {
     fd_pubkey_t va_pubkey = FD_LOAD( fd_pubkey_t, va_t1[i].address );
     uint idx = (uint)fd_vote_rewards_map_idx_query( vote_ele_map, &va_pubkey, UINT_MAX, runtime_stack->stakes.vote_ele );
     if( idx==UINT_MAX ) continue;
-    fd_epoch_credits_t const * ec = &fd_bank_epoch_credits( parent_bank )[idx];
-    ulong cnt  = ec->cnt;
-    ulong base = ec->base_credits;
+    fd_epoch_credits_t const * ec = &epoch_credits_view->credits[idx];
+    ulong base               = ec->base_credits;
+    int   has_ag_marker      = ec->has_ag_migration_marker;
+    ulong ag_marker_idx      = fd_epoch_credits_ag_marker_idx( ec, ag_migration_epoch );
+    ulong cnt                = (ulong)ec->cnt + (ulong)has_ag_marker;
     va_t1[i].epoch_credits_count = (pb_size_t)cnt;
     va_t1[i].epoch_credits = fd_spad_alloc( spad, alignof(fd_exec_test_epoch_credit_t), cnt * sizeof(fd_exec_test_epoch_credit_t) );
-    for( ulong j=0; j<cnt; j++ ) {
-      va_t1[i].epoch_credits[j].epoch        = ec->epoch[j];
-      va_t1[i].epoch_credits[j].credits      = base + ec->credits_delta[j];
-      va_t1[i].epoch_credits[j].prev_credits = base + ec->prev_credits_delta[j];
+    for( ulong k=0UL, j=0UL; k<cnt; k++ ) {
+      if( FD_UNLIKELY( k==ag_marker_idx ) ) {
+        va_t1[i].epoch_credits[k].epoch        = ULONG_MAX;
+        va_t1[i].epoch_credits[k].credits      = ULONG_MAX;
+        va_t1[i].epoch_credits[k].prev_credits = ULONG_MAX;
+        continue;
+      }
+      va_t1[i].epoch_credits[k].epoch        = ec->epoch[j];
+      va_t1[i].epoch_credits[k].credits      = base + ec->credits_delta[j];
+      va_t1[i].epoch_credits[k].prev_credits = base + ec->prev_credits_delta[j];
+      j++;
     }
   }
+  fd_epoch_credits_view_fini( epoch_credits_view );
 
   /* BlockContext -> acct_states
      Iterate over the set and dump all the account keys in one pass. */

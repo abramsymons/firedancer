@@ -423,6 +423,7 @@ fd_accdb_reset( fd_accdb_t * accdb ) {
       line->refcnt         = 0U;
       line->referenced     = 0;
       line->persisted      = 1;
+      line->seq            = 0U;
     }
   }
 
@@ -888,12 +889,20 @@ evict_clear_acc_cache_ref( fd_accdb_accmeta_t * accmeta,
                            ulong                line_idx ) {
   uint expected_cidx = FD_ACCDB_ACC_CIDX_PACK( (uint)size_class, (uint)line_idx );
 
-  /* CAS-acquire CLAIM.  If a cold-loader already holds CLAIM, they
-     own the publish path; bail without touching accmeta fields (their
-     republish is repointing accmeta->cache_idx away from our line). */
+  /* CAS-acquire CLAIM.  A holder with VALID clear is a cold-loader
+     publishing a different line, or a clearer that already severed the
+     binding: bail.  A holder with VALID set is another evictor,
+     acc_unlink or the deferred-free drain, none of which block while
+     holding CLAIM: wait, so whoever evicts the current line clears the
+     binding. */
   for(;;) {
     uint cur = FD_VOLATILE_CONST( accmeta->executable_size );
-    if( FD_UNLIKELY( cur & FD_ACCDB_SIZE_CACHE_CLAIM_BIT ) ) return;
+    if( FD_UNLIKELY( cur & FD_ACCDB_SIZE_CACHE_CLAIM_BIT ) ) {
+      if( !FD_ACCDB_SIZE_CACHE_VALID( cur ) ) return;
+      fd_racesan_hook( "accdb_evict_clear:claim_held" );
+      FD_SPIN_PAUSE();
+      continue;
+    }
     uint nxt = cur | FD_ACCDB_SIZE_CACHE_CLAIM_BIT;
     if( FD_LIKELY( FD_ATOMIC_CAS( &accmeta->executable_size, cur, nxt )==cur ) ) break;
     fd_racesan_hook( "accdb_evict_clear:claim_wait" );
@@ -905,8 +914,11 @@ evict_clear_acc_cache_ref( fd_accdb_accmeta_t * accmeta,
   /* CLAIM held.  If accmeta->cache_idx still points at our line, clear
      VALID and INVAL the cache_idx.  Otherwise the accmeta was already
      re-published into a different line; leave it alone. */
-  if( FD_LIKELY( FD_VOLATILE_CONST( accmeta->cache_idx )==expected_cidx ) ) {
+  uint es = FD_VOLATILE_CONST( accmeta->executable_size );
+  if( FD_LIKELY( FD_ACCDB_SIZE_CACHE_VALID( es ) &&
+                 FD_VOLATILE_CONST( accmeta->cache_idx )==expected_cidx ) ) {
     FD_ATOMIC_FETCH_AND_AND( &accmeta->executable_size, ~FD_ACCDB_SIZE_CACHE_VALID_BIT );
+    fd_racesan_hook( "accdb_evict_clear:pre_inval" );
     FD_VOLATILE( accmeta->cache_idx ) = FD_ACCDB_ACC_CIDX_INVAL;
   }
 
@@ -1070,6 +1082,23 @@ drain_deferred_frees( fd_accdb_t * accdb ) {
       fd_accdb_shmem_bytes_freed( accdb->shmem, off, entry_sz );
       FD_ATOMIC_FETCH_AND_SUB( &accdb->shmem->shmetrics->disk_used_bytes, entry_sz );
     }
+    /* A reader that captured this accmeta before the unlink may have
+       cold-loaded it since (tombstones skip the offset wait), publishing
+       a line and VALID, and an evictor of that line may be clearing the
+       binding right now under CLAIM.  Take CLAIM so that evictor has
+       finished its cache_idx store before pool.next overwrites it, then
+       leave the slot with VALID clear. */
+    for(;;) {
+      uint cur = FD_VOLATILE_CONST( accmeta->executable_size );
+      if( FD_UNLIKELY( cur & FD_ACCDB_SIZE_CACHE_CLAIM_BIT ) ) {
+        fd_racesan_hook( "accdb_drain:claim_wait" );
+        FD_SPIN_PAUSE();
+        continue;
+      }
+      if( FD_LIKELY( FD_ATOMIC_CAS( &accmeta->executable_size, cur, cur | FD_ACCDB_SIZE_CACHE_CLAIM_BIT )==cur ) ) break;
+      FD_SPIN_PAUSE();
+    }
+    FD_ATOMIC_FETCH_AND_AND( &accmeta->executable_size, ~(FD_ACCDB_SIZE_CACHE_VALID_BIT|FD_ACCDB_SIZE_CACHE_CLAIM_BIT) );
   }
 
   for( ulong i=0UL; i+1UL<n; i++ ) {
@@ -1679,6 +1708,8 @@ acquire_cache_line( fd_accdb_t * accdb,
       FD_SPIN_PAUSE();
     }
     result->referenced = 0;
+    FD_VOLATILE( result->seq ) = result->seq+1U;
+    FD_COMPILER_MFENCE();
     *out_evicted_acc_idx = UINT_MAX;
     return result;
   }
@@ -1732,6 +1763,8 @@ acquire_cache_line( fd_accdb_t * accdb,
     }
     *out_evicted_acc_idx    = line->persisted ? UINT_MAX : line->acc_idx;
     line->key.generation    = UINT_MAX;
+    FD_VOLATILE( line->seq ) = line->seq+1U;
+    FD_COMPILER_MFENCE();
     line->refcnt            = 1;
     line->referenced        = 0;
     return line;
@@ -1928,9 +1961,12 @@ allocate_next_write( fd_accdb_t * accdb,
 
 ulong
 fd_accdb_snapshot_reserve_write( fd_accdb_t * accdb,
-                                 ulong        sz ) {
-  FD_TEST( sz && sz<=accdb->shmem->partition_sz );
-  return allocate_next_write( accdb, sz );
+                                 ulong        sz,
+                                 ulong        dead_tail_sz ) {
+  FD_TEST( sz && sz<=accdb->shmem->partition_sz && dead_tail_sz<=sz );
+  ulong off = allocate_next_write( accdb, sz );
+  if( dead_tail_sz ) fd_accdb_shmem_bytes_freed( accdb->shmem, off+sz-dead_tail_sz, dead_tail_sz );
+  return off;
 }
 
 /* Compaction write allocation.  Single-threaded: only the compaction
@@ -3504,7 +3540,7 @@ release_inner( fd_accdb_t * accdb,
     } else {
       accdb->metrics->accounts_committed_new_per_class[ new_size_class ]++;
       fd_accdb_accmeta_t * accmeta = acc_pool_acquire( accdb->acc_pool_join );
-      FD_TEST( accmeta );
+      if( FD_UNLIKELY( !accmeta ) ) FD_LOG_ERR(( "accounts database ran out of space, increase [accounts.max_accounts], current value is %lu", acc_pool_ele_max( accdb->acc_pool_join ) ));
       ulong acc_idx = acc_pool_idx( accdb->acc_pool_join, accmeta );
       fd_memcpy( accmeta->key.pubkey, accs[ i ].pubkey, 32UL );
       accmeta->lamports        = accs[ i ].lamports;
@@ -3746,6 +3782,8 @@ fd_accdb_read_one_nocache( fd_accdb_t *       accdb,
     fd_accdb_cache_line_t * line = cache_line( accdb, cls, idx );
 
     for(;;) {
+      uint seq0 = FD_VOLATILE_CONST( line->seq );
+      FD_COMPILER_MFENCE();
       uint gen0 = FD_VOLATILE_CONST( line->key.generation );
       uint rc0  = FD_VOLATILE_CONST( line->refcnt );
       uint ai0  = FD_VOLATILE_CONST( line->acc_idx );
@@ -3760,13 +3798,17 @@ fd_accdb_read_one_nocache( fd_accdb_t *       accdb,
       if( FD_UNLIKELY( ai0==UINT_MAX ) ) goto miss;
 
       FD_COMPILER_MFENCE();
+      fd_racesan_hook( "accdb_nocache:pre_copy" );
       memcpy( out_owner, line->owner, 32UL );
       memcpy( out_data,  (uchar const *)(line+1UL), data_len );
+      fd_racesan_hook( "accdb_nocache:post_copy" );
       FD_COMPILER_MFENCE();
 
       uint gen1 = FD_VOLATILE_CONST( line->key.generation );
       uint rc1  = FD_VOLATILE_CONST( line->refcnt );
       uint ai1  = FD_VOLATILE_CONST( line->acc_idx );
+      uint seq1 = FD_VOLATILE_CONST( line->seq );
+      if( FD_UNLIKELY( seq1!=seq0 ) ) goto miss;
       if( FD_UNLIKELY( rc1==FD_ACCDB_EVICT_SENTINEL ) ) goto miss;
       if( FD_UNLIKELY( gen1!=snap_gen ) ) goto miss;
       if( FD_UNLIKELY( memcmp( line->key.pubkey, pubkey, 32UL ) ) ) goto miss;
@@ -4195,7 +4237,9 @@ fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,
   }
 
   fd_accdb_accmeta_t * acquired[ 8 ];
-  FD_TEST( acc_pool_acquire_batch( accdb->acc_pool_join, cnt, acquired ) );
+  if( FD_UNLIKELY( !acc_pool_acquire_batch( accdb->acc_pool_join, cnt, acquired ) ) ) {
+    FD_LOG_ERR(( "accounts database ran out of space during snapshot loading, increase [accounts.max_accounts], current value is %lu", acc_pool_ele_max( accdb->acc_pool_join ) ));
+  }
 
   /* Phase 2: walk and commit under the account chain lock. */
 
@@ -4478,14 +4522,11 @@ fd_accdb_cache_class_occupancy( fd_accdb_t * accdb,
 
 void
 fd_accdb_cache_class_thresholds( fd_accdb_t * accdb,
-                                 ulong *      target_used,
-                                 ulong *      low_water_used ) {
+                                 ulong *      free_target,
+                                 ulong *      free_low_water ) {
   for( ulong c=0UL; c<FD_ACCDB_CACHE_CLASS_CNT; c++ ) {
-    ulong max_c    = accdb->shmem->cache_class_max     [ c ];
-    ulong free_tgt = accdb->shmem->cache_free_target   [ c ];
-    ulong free_lwm = accdb->shmem->cache_free_low_water[ c ];
-    target_used   [ c ] = max_c>free_tgt ? max_c-free_tgt : 0UL;
-    low_water_used[ c ] = max_c>free_lwm ? max_c-free_lwm : 0UL;
+    free_target   [ c ] = accdb->shmem->cache_free_target   [ c ];
+    free_low_water[ c ] = accdb->shmem->cache_free_low_water[ c ];
   }
 }
 
@@ -4545,6 +4586,13 @@ fd_accdb_debug_line_addr( fd_accdb_t * accdb,
                           ulong        size_class,
                           ulong        line_idx ) {
   return cache_line( accdb, size_class, line_idx );
+}
+
+uint *
+fd_accdb_debug_acc_pool_next( fd_accdb_t * accdb,
+                              uint         acc_idx ) {
+  FD_TEST( (ulong)acc_idx<acc_pool_ele_max( accdb->acc_pool_join ) );
+  return &accdb->acc_pool[ acc_idx ].pool.next;
 }
 
 /* Deterministically evict a single specified cache line via the

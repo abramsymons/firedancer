@@ -123,8 +123,9 @@ struct fd_configf {
 
   struct {
     ulong max_live_slots;
-    ulong max_fork_width;
+    ulong stake_delegation_cache_cnt;
     ulong program_cache_size_mib;
+    ulong bank_cache_cnt;
   } runtime;
 
   struct {
@@ -133,6 +134,7 @@ struct fd_configf {
 
   struct {
     char wait_for_supermajority_with_bank_hash[ FD_BASE58_ENCODED_32_SZ ];
+    int  alpenglow;
   } consensus;
 
   struct {
@@ -177,7 +179,6 @@ struct fd_configf {
   struct {
     int hard_fork_fatal;
     int fixed_fec_sets;
-    int alpenglow;
 
     struct {
       ushort quic_client_listen_port;
@@ -309,9 +310,12 @@ struct fd_config {
     char genesis[ PATH_MAX ];
     char accounts[ PATH_MAX ];
     char stake_delegations[ PATH_MAX ];
+    char epoch_credits[ PATH_MAX ];
+    char cost_tracker[ PATH_MAX ];
+    char vote_stakes[ PATH_MAX ];
     char shredb[ PATH_MAX ];
     char guidb[ PATH_MAX ];
-    char tower[ PATH_MAX ];
+    char vote_history[ PATH_MAX ];
   } paths;
 
   struct {
@@ -548,18 +552,18 @@ struct fd_config {
     } repair;
 
     struct {
-      ulong  slot_max;
-    } rotor;
-
-    struct {
       int    enabled;
       ushort repair_serve_listen_port;
       ulong  shred_storage_limit_gib;
     } rserve;
 
     struct {
-      int write_tower_file;
+      int write_vote_history_file;
     } tower;
+
+    struct {
+      int write_vote_history_file;
+    } votor;
 
     struct {
       ulong max_transaction_lookahead_buffer_size;

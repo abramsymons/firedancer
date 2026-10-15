@@ -74,6 +74,12 @@ struct fd_backt_tile {
   ulong prev_fec_set_idx;
   ulong out_fec_set_idx;
 
+  /* The FEC set in progress, inserted into store once complete. */
+  uchar * fec_data;
+  uint    fec_data_idx;
+  uint    fec_data_sz;
+  ushort  fec_shred_sz[ FD_FEC_SHRED_CNT ];
+
   ulong start_slot;
   ulong end_slot;
 
@@ -214,10 +220,6 @@ after_credit( fd_backt_tile_t *   ctx,
               int *               charge_busy ) {
   (void)opt_poll_in;
 
-  if( FD_LIKELY( ctx->store && ctx->store_disk_fd>=0 &&
-                 fd_store_disk_maintain( ctx->store, ctx->store_disk_fd ) ) )
-    *charge_busy = 1;
-
   int process = ctx->shreds_cnt>=2UL || (ctx->source_exhausted && ctx->shreds_cnt );
   if( FD_UNLIKELY( !process ) ) return; /* need to buffer two in ordinary processing for completes fec lookahead */
   if( FD_UNLIKELY( !ctx->reasm_ready ) ) return;
@@ -243,26 +245,28 @@ after_credit( fd_backt_tile_t *   ctx,
      ledgers which may not have merkle roots or chained merkle roots. */
   fd_hash_t mr = { .ul[0] = shred->slot, .ul[1] = ctx->out_fec_set_idx };
   if( FD_UNLIKELY( begins_fec_set ) ) {
-    fd_store_fec_t * new_fec;
-    FD_TEST( !fd_store_insert( ctx->store, ctx->map_join, &mr, shred->slot, 0UL, &new_fec ) && new_fec );
-    FD_TEST( fd_store_fec_data_acquire( ctx->store, ctx->store_disk_fd, new_fec ) );
+    ctx->fec_data    = fd_store_fec_data_reserve( ctx->store, ctx->store_disk_fd, &ctx->fec_data_idx, NULL );
+    ctx->fec_data_sz = 0U;
+    memset( ctx->fec_shred_sz, 0, sizeof(ctx->fec_shred_sz) );
+    FD_TEST( ctx->fec_data );
   }
 
-  fd_store_fec_t * fec = fd_store_query( ctx->map_join, &mr );
-  if( FD_UNLIKELY( !fec->data_sz ) ) memset( fec->shred_sz, 0, sizeof(fec->shred_sz) );
-  if( FD_UNLIKELY( fec->data_sz+fd_shred_payload_sz( shred )>ctx->store->fec_data_max ) ) {
-    FD_LOG_ERR(( "backtest FEC payload exceeds store maximum (%lu>%lu)",
-                 fec->data_sz+fd_shred_payload_sz( shred ), ctx->store->fec_data_max ));
-  }
   ulong payload_sz = fd_shred_payload_sz( shred );
-  fd_memcpy( fd_store_fec_data( ctx->store, fec ) + fec->data_sz, fd_shred_data_payload( shred ), payload_sz );
-  fec->data_sz += (uint)payload_sz;
+  if( FD_UNLIKELY( ctx->fec_data_sz+payload_sz>ctx->store->fec_data_max ) ) {
+    FD_LOG_ERR(( "backtest FEC payload exceeds store maximum (%lu>%lu)",
+                 ctx->fec_data_sz+payload_sz, ctx->store->fec_data_max ));
+  }
+  fd_memcpy( ctx->fec_data + ctx->fec_data_sz, fd_shred_data_payload( shred ), payload_sz );
+  ctx->fec_data_sz += (uint)payload_sz;
   ulong shred_idx = out_shred_idx - ctx->out_fec_set_idx;
   if( FD_LIKELY( shred_idx<FD_FEC_SHRED_CNT ) ) {
     FD_TEST( payload_sz<=USHORT_MAX );
-    fec->shred_sz[ shred_idx ] = (ushort)payload_sz;
+    ctx->fec_shred_sz[ shred_idx ] = (ushort)payload_sz;
   }
-  if( FD_UNLIKELY( completes_fec_set ) ) fd_store_fec_data_publish( ctx->store, fec );
+  if( FD_UNLIKELY( completes_fec_set ) ) {
+    fd_store_fec_t * fec;
+    FD_TEST( !fd_store_insert( ctx->store, ctx->map_join, &mr, shred->slot, 0UL, ctx->fec_data_idx, ctx->fec_data_sz, ctx->fec_shred_sz, &fec ) && fec );
+  }
 
   ctx->shreds_idx = (ctx->shreds_idx+1UL)%SHRED_BUFFER_LEN;
   ctx->shreds_cnt--;
@@ -386,14 +390,14 @@ finish( fd_backt_tile_t * ctx,
       for( ulong i=0UL; i<ctx->event_in_cnt; i++ ) {
         if( FD_UNLIKELY( fd_seq_lt( fd_fseq_query( ctx->event_in_cons[ i ] ), fd_mcache_seq_query( ctx->event_in_prod[ i ] ) ) ) ) { drained = 0; break; }
       }
-      drained = drained && !ctx->event_metrics[ FD_METRICS_GAUGE_EVENT_QUEUE_UNSENT_OFF ];
+      drained = drained && !ctx->event_metrics[ FD_METRICS_GAUGE_EVENT_QUEUE_UNSENT_COUNT_OFF ];
       if( FD_LIKELY( drained ) ) break;
       if( FD_UNLIKELY( ctx->event_metrics[ FD_METRICS_GAUGE_EVENT_CONN_STATE_OFF ]!=FD_EVENT_CLIENT_STATE_CONNECTED ) ) {
-        FD_LOG_WARNING(( "exiting with %lu events unsent (event collector not connected)", ctx->event_metrics[ FD_METRICS_GAUGE_EVENT_QUEUE_UNSENT_OFF ] ));
+        FD_LOG_WARNING(( "exiting with %lu events unsent (event collector not connected)", ctx->event_metrics[ FD_METRICS_GAUGE_EVENT_QUEUE_UNSENT_COUNT_OFF ] ));
         break;
       }
       if( FD_UNLIKELY( fd_log_wallclock()>deadline ) ) {
-        FD_LOG_WARNING(( "exiting with %lu events unsent (drain timed out)", ctx->event_metrics[ FD_METRICS_GAUGE_EVENT_QUEUE_UNSENT_OFF ] ));
+        FD_LOG_WARNING(( "exiting with %lu events unsent (drain timed out)", ctx->event_metrics[ FD_METRICS_GAUGE_EVENT_QUEUE_UNSENT_COUNT_OFF ] ));
         break;
       }
       FD_SPIN_PAUSE();
@@ -734,7 +738,7 @@ unprivileged_init( fd_topo_t const *      topo,
     ctx->source_exhausted = 1;
   }
   FD_MGAUGE_SET( BACKT, START_SLOT, ctx->start_slot );
-  FD_MGAUGE_SET( BACKT, FINAL_SLOT, ctx->end_slot   );
+  FD_MGAUGE_SET( BACKT, END_SLOT,   fd_ulong_if( ctx->end_slot==ULONG_MAX, 0UL, ctx->end_slot ) );
 
   ulong store_obj_id = fd_pod_query_ulong( topo->props, "store", ULONG_MAX );
   FD_TEST( store_obj_id!=ULONG_MAX );

@@ -11,7 +11,7 @@
    or knowingly skipped) before the constant is bumped.  String keys of
    the user's own file are separately forced through the classification
    lists below. */
-FD_STATIC_ASSERT( sizeof(fd_config_t)==26557688UL, update_fd_config_to_json_for_the_layout_change );
+FD_STATIC_ASSERT( sizeof(fd_config_t)==26572016UL, update_fd_config_to_json_for_the_layout_change );
 
 #define REDACTED "[redacted]"
 
@@ -111,9 +111,12 @@ static char const * const jw_redacted_keys[] = {
   "paths.genesis",
   "paths.accounts",
   "paths.stake_delegations",
+  "paths.epoch_credits",
+  "paths.cost_tracker",
+  "paths.vote_stakes",
   "paths.shredb",
   "paths.guidb",
-  "paths.tower",
+  "paths.vote_history",
   "log.path",
   "gossip.host",
   "snapshots.sources.servers",
@@ -324,9 +327,12 @@ fd_config_to_json( fd_config_t const * config,
     jw_path( &w, "genesis",                 config->paths.genesis );
     jw_path( &w, "accounts",                config->paths.accounts );
     jw_path( &w, "stake_delegations",       config->paths.stake_delegations );
+    jw_path( &w, "epoch_credits",           config->paths.epoch_credits );
+    jw_path( &w, "cost_tracker",            config->paths.cost_tracker );
+    jw_path( &w, "vote_stakes",             config->paths.vote_stakes );
     jw_path( &w, "shredb",                  config->paths.shredb );
     jw_path( &w, "guidb",                   config->paths.guidb );
-    jw_path( &w, "tower",                   config->paths.tower );
+    jw_path( &w, "vote_history",            config->paths.vote_history );
     jw_path_arr( &w, "authorized_voter_paths", f->paths.authorized_voter_paths_cnt );
   jw_obj_close( &w );
 
@@ -343,6 +349,7 @@ fd_config_to_json( fd_config_t const * config,
     jw_str  ( &w, "expected_genesis_hash",         config->consensus.expected_genesis_hash );
     jw_bool ( &w, "wait_for_vote_to_start_leader", config->consensus.wait_for_vote_to_start_leader );
     jw_str  ( &w, "wait_for_supermajority_with_bank_hash", f->consensus.wait_for_supermajority_with_bank_hash );
+    jw_bool ( &w, "alpenglow",                     f->consensus.alpenglow );
   jw_obj_close( &w );
 
   jw_obj_open( &w, "gossip" );
@@ -378,8 +385,9 @@ fd_config_to_json( fd_config_t const * config,
 
   jw_obj_open( &w, "runtime" );
     jw_ulong( &w, "max_live_slots", f->runtime.max_live_slots );
-    jw_ulong( &w, "max_fork_width", f->runtime.max_fork_width );
+    jw_ulong( &w, "stake_delegation_cache_cnt", f->runtime.stake_delegation_cache_cnt );
     jw_ulong( &w, "program_cache_size_mib", f->runtime.program_cache_size_mib );
+    jw_ulong( &w, "bank_cache_cnt", f->runtime.bank_cache_cnt );
   jw_obj_close( &w );
 
   jw_obj_open( &w, "snapshots" );
@@ -457,7 +465,6 @@ fd_config_to_json( fd_config_t const * config,
     jw_str ( &w, "core_dump", config->development.core_dump );
     jw_bool( &w, "hard_fork_fatal", f->development.hard_fork_fatal );
     jw_bool( &w, "fixed_fec_sets",  f->development.fixed_fec_sets );
-    jw_bool( &w, "alpenglow",       f->development.alpenglow );
     jw_obj_open( &w, "votor" );
       jw_ulong( &w, "quic_client_listen_port", f->development.votor.quic_client_listen_port );
       jw_ulong( &w, "quic_server_listen_port", f->development.votor.quic_server_listen_port );
@@ -615,16 +622,16 @@ fd_config_to_json( fd_config_t const * config,
       jw_ulong( &w, "repair_client_listen_port", config->tiles.repair.repair_client_listen_port );
       jw_ulong( &w, "slot_max",                  config->tiles.repair.slot_max );
     jw_obj_close( &w );
-    jw_obj_open( &w, "rotor" );
-      jw_ulong( &w, "slot_max",                  config->tiles.rotor.slot_max );
-    jw_obj_close( &w );
     jw_obj_open( &w, "rserve" );
       jw_bool ( &w, "enabled",                   config->tiles.rserve.enabled );
       jw_ulong( &w, "repair_serve_listen_port",  config->tiles.rserve.repair_serve_listen_port );
       jw_ulong( &w, "shred_storage_limit_gib",   config->tiles.rserve.shred_storage_limit_gib );
     jw_obj_close( &w );
     jw_obj_open( &w, "tower" );
-      jw_bool ( &w, "write_tower_file",          config->tiles.tower.write_tower_file );
+      jw_bool ( &w, "write_vote_history_file",   config->tiles.tower.write_vote_history_file );
+    jw_obj_close( &w );
+    jw_obj_open( &w, "votor" );
+      jw_bool ( &w, "write_vote_history_file",   config->tiles.votor.write_vote_history_file );
     jw_obj_close( &w );
     jw_obj_open( &w, "replay" );
       jw_ulong( &w, "max_transaction_lookahead_buffer_size", config->tiles.replay.max_transaction_lookahead_buffer_size );

@@ -4,7 +4,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <linux/falloc.h>
 
 #define FD_STORE_FEC_DATA_VIEW_SPILL (1U)
 
@@ -99,11 +98,6 @@ cache_free_laddr( fd_store_t const * store ) {
 static inline uint *
 spill_free_laddr( fd_store_t const * store ) {
   return fd_wksp_laddr_fast( fd_store_wksp( store ), store->spill_free_gaddr );
-}
-
-static inline uint *
-spill_reclaim_laddr( fd_store_t const * store ) {
-  return fd_wksp_laddr_fast( fd_store_wksp( store ), store->spill_reclaim_gaddr );
 }
 
 static inline uchar *
@@ -206,25 +200,10 @@ cache_lru_push_tail_locked( fd_store_t *     store,
 }
 
 static void
-spill_reclaim_push_locked( fd_store_t * store,
-                           uint         spill_slot ) {
-  FD_TEST( spill_slot<store->spill_slot_cnt );
-  FD_TEST( store->spill_reclaim_cnt+store->spill_reclaiming_cnt+store->spill_reuse_cnt<store->fec_max );
-  spill_reclaim_laddr( store )[ store->spill_reclaim_cnt++ ] = spill_slot;
-}
-
-static void
-spill_reuse_push_locked( fd_store_t * store,
-                         uint         spill_slot ) {
-  FD_TEST( spill_slot<store->spill_slot_cnt );
-  FD_TEST( store->spill_reclaim_cnt+store->spill_reclaiming_cnt+store->spill_reuse_cnt<store->fec_max );
-  spill_reclaim_laddr( store )[ store->fec_max-1UL-store->spill_reuse_cnt++ ] = spill_slot;
-}
-
-static uint
-spill_reuse_pop_locked( fd_store_t * store ) {
-  FD_TEST( store->spill_reuse_cnt );
-  return spill_reclaim_laddr( store )[ store->fec_max-store->spill_reuse_cnt-- ];
+spill_free_push_locked( fd_store_t * store,
+                        uint         spill_slot ) {
+  FD_TEST( spill_slot<store->spill_slot_cnt && store->spill_free_cnt<store->spill_slot_cnt );
+  spill_free_laddr( store )[ store->spill_free_cnt++ ] = spill_slot;
 }
 
 static void
@@ -241,7 +220,7 @@ cache_consume_locked( fd_store_t *     store,
     ulong spill_slot = fec->data_idx;
     FD_TEST( spill_slot<store->spill_slot_cnt && atomic_load_explicit( &store->spill_live_cnt, memory_order_relaxed ) );
     atomic_fetch_sub_explicit( &store->spill_live_cnt, 1UL, memory_order_relaxed );
-    spill_reclaim_push_locked( store, (uint)spill_slot );
+    spill_free_push_locked( store, (uint)spill_slot );
   }
 
   fec->data_idx             = 0U;
@@ -282,21 +261,11 @@ spill_one_locked( fd_store_t                 * store,
   FD_TEST( victim->data_sz<=store->fec_data_max );
 
   uint spill_slot;
-  int  spill_slot_allocated;
-  if( FD_LIKELY( store->spill_reuse_cnt ) ) {
-    spill_slot           = spill_reuse_pop_locked( store );
-    spill_slot_allocated = 1;
-  } else if( FD_LIKELY( store->spill_reclaim_cnt ) ) {
-    spill_slot           = spill_reclaim_laddr( store )[ --store->spill_reclaim_cnt ];
-    spill_slot_allocated = 1;
-  } else if( FD_LIKELY( store->spill_free_cnt ) ) {
-    spill_slot           = spill_free_laddr( store )[ --store->spill_free_cnt ];
-    spill_slot_allocated = 0;
+  if( FD_LIKELY( store->spill_free_cnt ) ) {
+    spill_slot = spill_free_laddr( store )[ --store->spill_free_cnt ];
   } else {
-    if( FD_UNLIKELY( store->spill_slot_cnt>=store->fec_max ) )
-      return store->spill_reclaiming_cnt ? FD_STORE_SPILL_RETRY : FD_STORE_SPILL_NONE;
-    spill_slot           = (uint)store->spill_slot_cnt++;
-    spill_slot_allocated = 0;
+    if( FD_UNLIKELY( store->spill_slot_cnt>=store->fec_max ) ) return FD_STORE_SPILL_NONE;
+    spill_slot = (uint)store->spill_slot_cnt++;
   }
 
   ulong ram_slot  = victim->data_idx;
@@ -317,8 +286,7 @@ spill_one_locked( fd_store_t                 * store,
   int result;
   if( FD_UNLIKELY( victim->data_pin_cnt || victim->data_consume_pending ) ) {
     int try_next = !!victim->data_pin_cnt;
-    atomic_fetch_add_explicit( &store->spill_allocated_cnt, (ulong)!spill_slot_allocated, memory_order_relaxed );
-    spill_reclaim_push_locked( store, spill_slot );
+    spill_free_push_locked( store, spill_slot );
     victim->data_state = victim->data_consume_pending && !victim->data_pin_cnt
                        ? FD_STORE_FEC_DATA_RAM_WRITING
                        : FD_STORE_FEC_DATA_RAM_READY;
@@ -331,7 +299,6 @@ spill_one_locked( fd_store_t                 * store,
     victim->data_idx   = spill_slot;
     victim->data_state = FD_STORE_FEC_DATA_DISK;
     atomic_fetch_add_explicit( &store->spill_live_cnt, 1UL, memory_order_relaxed );
-    atomic_fetch_add_explicit( &store->spill_allocated_cnt, (ulong)!spill_slot_allocated, memory_order_relaxed );
     atomic_fetch_add_explicit( &store->fec_spill_cnt, 1UL, memory_order_relaxed );
     atomic_fetch_add_explicit( &store->fec_spill_bytes, data_sz, memory_order_relaxed );
     cache_slot_release_locked( store, ram_slot );
@@ -367,6 +334,7 @@ fd_store_new( void       * shmem,
   if( FD_UNLIKELY( !fec_data_max ) ) { FD_LOG_WARNING(( "fec_data_max must be non-zero" )); return NULL; }
   if( FD_UNLIKELY( fec_data_max>UINT_MAX ) ) { FD_LOG_WARNING(( "fec_data_max must fit in uint" )); return NULL; }
   if( FD_UNLIKELY( !max_shreds_per_block || max_shreds_per_block>FD_SHREDB_HINT_VALID ) ) { FD_LOG_WARNING(( "bad max_shreds_per_block (%lu)", max_shreds_per_block )); return NULL; }
+  if( FD_UNLIKELY( alpenglow && !shred_tile_cnt ) ) { FD_LOG_WARNING(( "alpenglow needs a slot_to_fecs partition per shred tile" )); return NULL; }
   if( FD_UNLIKELY( shred_storage_gib>FD_SHREDB_MAX_SIZE_GIB ) ) {
     FD_LOG_ERR(( "shred database size limit is %lu GiB, but the maximum supported size is %lu GiB",
                  shred_storage_gib, FD_SHREDB_MAX_SIZE_GIB ));
@@ -379,7 +347,7 @@ fd_store_new( void       * shmem,
   if( FD_UNLIKELY( !wksp ) ) { FD_LOG_WARNING(( "shmem must be part of a workspace" )); return NULL; }
 
   ulong chain_cnt       = fd_store_map_chain_cnt_est( fec_max );
-  ulong part_cnt        = alpenglow ? 1UL+shred_tile_cnt : 0UL;
+  ulong part_cnt        = alpenglow ? shred_tile_cnt : 0UL;
   ulong slot_chain_cnt  = fd_store_slot_to_fecs_chain_cnt_est( fec_max );
   ulong slot_to_fecs_sz = fd_ulong_align_up( fd_store_slot_to_fecs_footprint( slot_chain_cnt ), fd_store_slot_to_fecs_align() );
   ulong payload_slot_sz = fd_store_payload_slot_sz( fec_data_max );
@@ -396,7 +364,6 @@ fd_store_new( void       * shmem,
   uchar *        cache_mem      = FD_SCRATCH_ALLOC_APPEND( l, FD_STORE_PAYLOAD_PAGE_SZ, payload_slot_sz*cache_slot_cnt      );
   ulong *        cache_free     = FD_SCRATCH_ALLOC_APPEND( l, alignof(ulong),           sizeof(ulong)*cache_slot_cnt        );
   uint *         spill_free     = FD_SCRATCH_ALLOC_APPEND( l, alignof(uint),            sizeof(uint)*fec_max                );
-  uint *         spill_reclaim  = FD_SCRATCH_ALLOC_APPEND( l, alignof(uint),            sizeof(uint)*fec_max                );
   uchar *        spill_read_mem = FD_SCRATCH_ALLOC_APPEND( l, FD_STORE_PAYLOAD_PAGE_SZ, payload_slot_sz                      );
   fd_fec_set_t * fec_sets       = fec_set_cnt
                                 ? FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_fec_set_t), sizeof(fd_fec_set_t)*fec_set_cnt )
@@ -468,7 +435,6 @@ fd_store_new( void       * shmem,
   store->cache_lru_head        = UINT_MAX;
   store->cache_lru_tail        = UINT_MAX;
   store->spill_free_gaddr      = fd_wksp_gaddr_fast( wksp, spill_free );
-  store->spill_reclaim_gaddr   = fd_wksp_gaddr_fast( wksp, spill_reclaim );
   store->spill_read_data_gaddr = fd_wksp_gaddr_fast( wksp, spill_read_mem );
   store->fec_set_cnt           = fec_set_cnt;
   store->fec_sets_gaddr        = fec_set_cnt ? fd_wksp_gaddr_fast( wksp, fec_sets ) : 0UL;
@@ -478,7 +444,6 @@ fd_store_new( void       * shmem,
   fd_rwlock_new( &store->fec_lock );
   atomic_init( &store->fec_spill_cnt, 0UL );
   atomic_init( &store->spill_live_cnt, 0UL );
-  atomic_init( &store->spill_allocated_cnt, 0UL );
   atomic_init( &store->fec_spill_bytes, 0UL );
   atomic_init( &store->fec_spill_read_cnt, 0UL );
   atomic_init( &store->fec_spill_read_bytes, 0UL );
@@ -621,36 +586,15 @@ fd_store_delete( void * shstore ) {
 
 
 uchar *
-fd_store_fec_data_acquire( fd_store_t     * store,
-                           int              disk_fd,
-                           fd_store_fec_t * fec ) {
-  return fd_store_fec_data_acquire_ex( store, disk_fd, fec, NULL );
-}
-
-uchar *
-fd_store_fec_data_acquire_ex( fd_store_t                  * store,
-                              int                           disk_fd,
-                              fd_store_fec_t              * fec,
-                              fd_store_fec_spill_stats_t * spill ) {
+fd_store_fec_data_reserve( fd_store_t                 * store,
+                           int                          disk_fd,
+                           uint                       * data_idx,
+                           fd_store_fec_spill_stats_t * spill ) {
   if( FD_LIKELY( spill ) ) *spill = (fd_store_fec_spill_stats_t){0};
-  if( FD_UNLIKELY( !store || !fec ) ) return NULL;
+  if( FD_UNLIKELY( !store || !data_idx ) ) return NULL;
 
-  fd_store_fec_t * fec0 = pool_ele_laddr( store );
-  if( FD_UNLIKELY( fec<fec0 || fec>=fec0+store->fec_max ) ) return NULL;
-
+  /* Pops a free RAM cache slot, spilling LRU payloads as needed. */
   fd_rwlock_write( &store->cache_lock );
-
-  if( FD_UNLIKELY( fec->data_state==FD_STORE_FEC_DATA_RAM_WRITING ) ) {
-    uchar * data = cache_data_laddr( store ) + (ulong)fec->data_idx*store->payload_slot_sz;
-    fd_rwlock_unwrite( &store->cache_lock );
-    return data;
-  }
-
-  if( FD_UNLIKELY( fec->data_state!=FD_STORE_FEC_DATA_EMPTY &&
-                   fec->data_state!=FD_STORE_FEC_DATA_CONSUMED ) ) {
-    fd_rwlock_unwrite( &store->cache_lock );
-    return NULL;
-  }
 
   while( FD_UNLIKELY( !store->cache_free_cnt ) ) {
     if( FD_UNLIKELY( store->cache_lru_head==UINT_MAX ) ) {
@@ -672,17 +616,11 @@ fd_store_fec_data_acquire_ex( fd_store_t                  * store,
     }
   }
 
-  ulong * free = cache_free_laddr( store );
-  ulong slot = free[ --store->cache_free_cnt ];
-  fec->data_idx     = (uint)slot;
-  fec->cache_prev   = UINT_MAX;
-  fec->cache_next   = UINT_MAX;
-  fec->data_pin_cnt = 0U;
-  fec->data_state   = FD_STORE_FEC_DATA_RAM_WRITING;
-
-  uchar * data = cache_data_laddr( store ) + (ulong)fec->data_idx*store->payload_slot_sz;
+  ulong slot = cache_free_laddr( store )[ --store->cache_free_cnt ];
   fd_rwlock_unwrite( &store->cache_lock );
-  return data;
+
+  *data_idx = (uint)slot;
+  return cache_data_laddr( store ) + slot*store->payload_slot_sz;
 }
 
 int
@@ -726,17 +664,6 @@ fd_store_fec_cache_stats_query( fd_store_t                 * store,
   stats->target    = store->cache_free_target;
   stats->low_water = store->cache_free_low_water;
   fd_rwlock_unread( &store->cache_lock );
-}
-
-void
-fd_store_fec_data_publish( fd_store_t     * store,
-                           fd_store_fec_t * fec ) {
-  fd_rwlock_write( &store->cache_lock );
-  FD_TEST( fec->data_state==FD_STORE_FEC_DATA_RAM_WRITING );
-  FD_TEST( fec->data_sz<=store->fec_data_max );
-  fec->data_state = FD_STORE_FEC_DATA_RAM_READY;
-  cache_lru_push_tail_locked( store, fec );
-  fd_rwlock_unwrite( &store->cache_lock );
 }
 
 static void
@@ -859,8 +786,12 @@ fd_store_insert( fd_store_t *       store,
                  fd_hash_t const *  merkle_root,
                  ulong              slot,
                  ulong              part,
+                 uint               data_idx,
+                 uint               data_sz,
+                 ushort const       shred_sz[ FD_FEC_SHRED_CNT ],
                  fd_store_fec_t **  fec ) {
-  FD_TEST( store && map && merkle_root && fec );
+  FD_TEST( store && map && merkle_root && shred_sz && fec );
+  FD_TEST( data_idx<store->cache_slot_cnt && data_sz<=store->fec_data_max );
   *fec = NULL;
   fd_rwlock_read( &store->fec_lock );
 
@@ -877,9 +808,20 @@ fd_store_insert( fd_store_t *       store,
   if( FD_LIKELY( err==FD_MAP_ERR_KEY ) ) {
     fd_store_fec_t * new_fec = fd_store_fec_acquire( store );
     FD_TEST( new_fec );
-    new_fec->key = *merkle_root;
+    new_fec->key     = *merkle_root;
+    new_fec->data_sz = data_sz;
+    memcpy( new_fec->shred_sz, shred_sz, sizeof(new_fec->shred_sz) );
+
+    /* RAM_READY before it is linked: fd_store_publish (exclusive
+       fec_lock) never sees it mid-write. */
+    fd_rwlock_write( &store->cache_lock );
+    new_fec->data_idx   = data_idx;
+    new_fec->data_state = FD_STORE_FEC_DATA_RAM_READY;
+    cache_lru_push_tail_locked( store, new_fec );
+    fd_rwlock_unwrite( &store->cache_lock );
+
     if( FD_LIKELY( store->alpenglow ) ) {
-      FD_TEST( part<=store->shred_tile_cnt );
+      FD_TEST( part<store->shred_tile_cnt );
       new_fec->slot = (uint)fd_ulong_max( slot, store->root );
       ulong lo = atomic_load_explicit( &store->slot_lo, memory_order_relaxed );
       while( new_fec->slot<lo && !atomic_compare_exchange_weak_explicit( &store->slot_lo, &lo, new_fec->slot, memory_order_relaxed, memory_order_relaxed ) );
@@ -896,6 +838,12 @@ fd_store_insert( fd_store_t *       store,
   FD_TEST( !fd_store_map_txn_test( txn ) );
   fd_store_map_txn_fini( txn );
   fd_rwlock_unread( &store->fec_lock );
+
+  if( FD_UNLIKELY( err==FD_MAP_ERR_KEY ) ) {
+    fd_rwlock_write( &store->cache_lock );
+    cache_slot_release_locked( store, data_idx );
+    fd_rwlock_unwrite( &store->cache_lock );
+  }
   return err;
 }
 
@@ -920,7 +868,7 @@ fd_store_publish( fd_store_t *     store,
   ulong            cnt  = 0UL;
   fd_rwlock_write( &store->fec_lock );
   ulong            lo   = atomic_load_explicit( &store->slot_lo, memory_order_relaxed );
-  for( ulong part=0UL; store->alpenglow && part<=store->shred_tile_cnt; part++ ) {
+  for( ulong part=0UL; store->alpenglow && part<store->shred_tile_cnt; part++ ) {
     fd_store_slot_to_fecs_t * slot_to_fecs = fd_store_slot_to_fecs_join( slot_to_fecs_laddr( store, part ) );
     for( ulong slot=lo; slot<root; slot++ ) {
       uint key = (uint)slot;
@@ -1139,7 +1087,7 @@ fd_store_disk_insert( fd_store_t       * store,
 
   /* Skip exact duplicates before taking a cell, which would otherwise
      evict an older shred.  disk_exact_publish still catches races. */
-  if( FD_UNLIKELY( store->has_root_map && disk_root_present( store, &root_key ) ) ) return FD_STORE_DISK_INSERT_SUCCESS;
+  if( FD_UNLIKELY( store->has_root_map && disk_root_present( store, &root_key ) ) ) return FD_STORE_DISK_INSERT_DUP;
 
   ulong ticket = atomic_fetch_add_explicit( &store->disk_reservation_head, 1UL, memory_order_relaxed ) + 1UL;
   if( FD_UNLIKELY( !ticket || ticket>(ULONG_MAX>>2) ) ) return FD_STORE_DISK_INSERT_ERR;
@@ -1189,7 +1137,7 @@ fd_store_disk_insert( fd_store_t       * store,
   atomic_store_explicit( cell_tag, disk_cell_tag( ticket, FD_SHREDB_CELL_INVALID ), memory_order_release );
   if( old_state==FD_SHREDB_CELL_READY )
     atomic_fetch_sub_explicit( &store->disk_cnt, 1UL, memory_order_relaxed );
-  if( publish_result==DISK_PUBLISH_NOOP ) return FD_STORE_DISK_INSERT_SUCCESS;
+  if( publish_result==DISK_PUBLISH_NOOP ) return FD_STORE_DISK_INSERT_DUP;
   return FD_STORE_DISK_INSERT_ERR;
 }
 
@@ -1315,6 +1263,22 @@ fd_store_disk_query_root( fd_store_t const * store,
 }
 
 int
+fd_store_disk_probe( fd_store_t const * store,
+                     ulong              slot,
+                     uint               shred_idx ) {
+  if( FD_UNLIKELY( !store || !fd_store_has_disk( store ) || slot>=FD_SHREDB_KEY_SLOT_MAX ) ) return 0;
+  if( FD_UNLIKELY( shred_idx==UINT_MAX ) ) {
+    return !!(atomic_load_explicit( disk_slot_hint_laddr( store ) + (slot % store->disk_max_slots), memory_order_acquire ) & FD_SHREDB_HINT_VALID);
+  }
+  if( FD_UNLIKELY( shred_idx>=store->max_shreds_per_block ) ) return 0;
+  fd_shredb_map_key_t map_key = fd_shredb_key_pack( slot, shred_idx );
+  fd_shredb_shred_map_t map[1];
+  FD_TEST( disk_shred_map_ljoin( store, map ) );
+  fd_shredb_shred_map_query_t query[1];
+  return fd_shredb_shred_map_query_try( map, &map_key, NULL, query, 0 )!=FD_MAP_ERR_KEY;
+}
+
+int
 fd_store_disk_query_highest( fd_store_t const * store,
                              int                disk_fd,
                              ulong              slot,
@@ -1349,48 +1313,6 @@ fd_store_disk_query_highest( fd_store_t const * store,
   return FD_STORE_DISK_QUERY_BUSY;
 }
 
-static int
-spill_reclaim_one( fd_store_t * store,
-                   int          disk_fd ) {
-  if( FD_LIKELY( !FD_VOLATILE_CONST( store->spill_reclaim_cnt ) ) ) return 0;
-
-  fd_rwlock_write( &store->cache_lock );
-  if( FD_LIKELY( !store->spill_reclaim_cnt ) ) {
-    fd_rwlock_unwrite( &store->cache_lock );
-    return 0;
-  }
-  uint spill_slot = spill_reclaim_laddr( store )[ --store->spill_reclaim_cnt ];
-  store->spill_reclaiming_cnt++;
-  fd_rwlock_unwrite( &store->cache_lock );
-
-  off_t off = (off_t)((ulong)spill_slot*store->payload_slot_sz);
-  int err = fallocate( disk_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, off, (off_t)store->payload_slot_sz );
-  int err_no = errno;
-
-  fd_rwlock_write( &store->cache_lock );
-  FD_TEST( store->spill_reclaiming_cnt );
-  store->spill_reclaiming_cnt--;
-  if( FD_LIKELY( !err ) ) {
-    FD_TEST( atomic_load_explicit( &store->spill_allocated_cnt, memory_order_relaxed ) );
-    atomic_fetch_sub_explicit( &store->spill_allocated_cnt, 1UL, memory_order_relaxed );
-    FD_TEST( store->spill_free_cnt<store->spill_slot_cnt );
-    spill_free_laddr( store )[ store->spill_free_cnt++ ] = spill_slot;
-  } else {
-    spill_reuse_push_locked( store, spill_slot );
-  }
-  fd_rwlock_unwrite( &store->cache_lock );
-  if( FD_UNLIKELY( err ) )
-    FD_LOG_WARNING(( "error reclaiming spilled FEC page: (%d-%s)", err_no, fd_io_strerror( err_no ) ));
-  return 1;
-}
-
-int
-fd_store_disk_maintain( fd_store_t * store,
-                        int          disk_fd ) {
-  if( FD_UNLIKELY( !store || disk_fd<0 ) ) return 0;
-  return spill_reclaim_one( store, disk_fd );
-}
-
 int
 fd_store_disk_stats_query( fd_store_t const *      store,
                            fd_store_disk_stats_t * stats ) {
@@ -1400,7 +1322,7 @@ fd_store_disk_stats_query( fd_store_t const *      store,
                          + atomic_load_explicit( &store->spill_live_cnt, memory_order_relaxed )*store->payload_slot_sz;
   stats->allocated_bytes = fd_ulong_min( atomic_load_explicit( &store->disk_reservation_head, memory_order_relaxed ),
                                         store->disk_max_shreds )*sizeof(fd_shredb_entry_t)
-                         + atomic_load_explicit( &store->spill_allocated_cnt, memory_order_relaxed )*store->payload_slot_sz;
+                         + FD_VOLATILE_CONST( store->spill_slot_cnt )*store->payload_slot_sz;
   stats->insert_cnt      = atomic_load_explicit( &store->disk_insert_cnt, memory_order_relaxed );
   stats->write_bytes     = atomic_load_explicit( &store->disk_write_bytes, memory_order_relaxed );
   return 0;

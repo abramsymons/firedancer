@@ -267,7 +267,7 @@ typedef struct {
   fd_store_t    * store;
   fd_store_map_t  map_join[1];
   int             disk_fd;
-  int             store_maintenance;
+  int             alpenglow;
 
   fd_gossip_update_message_t gossip_upd_buf[1];
 
@@ -409,35 +409,25 @@ during_housekeeping( fd_shred_ctx_t * ctx ) {
 
 static inline void
 metrics_write( fd_shred_ctx_t * ctx ) {
-  FD_MHIST_COPY( SHRED, REPAIR_COMPLETION_LAG_SECONDS, fd_fec_resolver_completion_lag_hist( ctx->resolver ) );
-  FD_MHIST_COPY( SHRED, CONTACT_INFO_PER_MESSAGE,   ctx->metrics->contact_info_cnt             );
-  FD_MHIST_COPY( SHRED, BATCH_SIZE_BYTES,           ctx->metrics->batch_sz                     );
-  FD_MHIST_COPY( SHRED, MICROBLOCK_PER_BATCH,       ctx->metrics->batch_microblock_cnt         );
-  FD_MHIST_COPY( SHRED, SHREDDING_DURATION_SECONDS, ctx->metrics->shredding_timing             );
-  FD_MHIST_COPY( SHRED, ADD_SHRED_DURATION_SECONDS, ctx->metrics->add_shred_timing             );
-  FD_MHIST_COPY( SHRED, FEC_FALLBACK_WRITE_SECONDS, ctx->metrics->fec_fallback_write_timing    );
-  FD_MCNT_SET  ( SHRED, SHRED_REPAIR_RX,            ctx->metrics->repair_rcv_cnt               );
-  FD_MCNT_SET  ( SHRED, SHRED_REPAIR_RX_BYTES,      ctx->metrics->repair_rcv_bytes             );
-  FD_MCNT_SET  ( SHRED, SHRED_TURBINE_RX,           ctx->metrics->turbine_rcv_cnt              );
-  FD_MCNT_SET  ( SHRED, SHRED_TURBINE_RX_BYTES,     ctx->metrics->turbine_rcv_bytes            );
-  FD_MCNT_SET  ( SHRED, NONCE_INVALID,              ctx->metrics->bad_nonce                    );
-  FD_MCNT_SET  ( SHRED, FEC_FALLBACK_WRITE,          ctx->metrics->fec_fallback_write_cnt       );
-  FD_MCNT_SET  ( SHRED, FEC_FALLBACK_WRITE_BYTES,    ctx->metrics->fec_fallback_write_bytes     );
+  FD_MHIST_COPY( SHRED, REPAIR_LEAD_DELAY_NANOS,             fd_fec_resolver_completion_lag_hist( ctx->resolver ) );
+  FD_MHIST_COPY( SHRED, DEST_PER_UPDATE,                     ctx->metrics->contact_info_cnt                       );
+  FD_MHIST_COPY( SHRED, BATCH_SIZE_BYTES,                    ctx->metrics->batch_sz                               );
+  FD_MHIST_COPY( SHRED, MICROBLOCK_PER_BATCH,                ctx->metrics->batch_microblock_cnt                   );
+  FD_MHIST_COPY( SHRED, BATCH_SHRED_DURATION_NANOS,          ctx->metrics->shredding_timing                       );
+  FD_MHIST_COPY( SHRED, ADD_SHRED_DURATION_NANOS,            ctx->metrics->add_shred_timing                       );
+  FD_MHIST_COPY( SHRED, STORE_FEC_SYNC_SPILL_DURATION_NANOS, ctx->metrics->fec_fallback_write_timing              );
+  FD_MCNT_SET  ( SHRED, REPAIR_RX,                           ctx->metrics->repair_rcv_cnt                         );
+  FD_MCNT_SET  ( SHRED, REPAIR_RX_BYTES,                     ctx->metrics->repair_rcv_bytes                       );
+  FD_MCNT_SET  ( SHRED, TURBINE_RX,                          ctx->metrics->turbine_rcv_cnt                        );
+  FD_MCNT_SET  ( SHRED, TURBINE_RX_BYTES,                    ctx->metrics->turbine_rcv_bytes                      );
+  FD_MCNT_SET  ( SHRED, REPAIR_NONCE_FAILED,                 ctx->metrics->bad_nonce                              );
+  FD_MCNT_SET  ( SHRED, STORE_FEC_SYNC_SPILLED,              ctx->metrics->fec_fallback_write_cnt                 );
+  FD_MCNT_SET  ( SHRED, STORE_FEC_SYNC_SPILLED_BYTES,        ctx->metrics->fec_fallback_write_bytes               );
 
-  FD_MCNT_SET  ( SHRED, BLOCK_ID_INVALID,           ctx->metrics->invalid_block_id_cnt         );
-  FD_MCNT_SET  ( SHRED, SHRED_UNCHAINED_REJECTED,   ctx->metrics->shred_rejected_unchained_cnt );
+  FD_MCNT_SET  ( SHRED, PARENT_BLOCK_ID_ZEROED, ctx->metrics->invalid_block_id_cnt         );
+  FD_MCNT_SET  ( SHRED, UNCHAINED_REJECTED,     ctx->metrics->shred_rejected_unchained_cnt );
 
-  FD_MCNT_ENUM_COPY( SHRED, SHRED_PROCESSED, ctx->metrics->shred_processing_result             );
-}
-
-static void
-after_credit( fd_shred_ctx_t *    ctx,
-              fd_stem_context_t * stem FD_PARAM_UNUSED,
-              int *               opt_poll_in FD_PARAM_UNUSED,
-              int *               charge_busy ) {
-  if( FD_UNLIKELY( ctx->store_maintenance && ctx->disk_fd>=0 &&
-                   fd_store_disk_maintain( ctx->store, ctx->disk_fd ) ) )
-    *charge_busy = 1;
+  FD_MCNT_ENUM_COPY( SHRED, PROCESSED,      ctx->metrics->shred_processing_result      );
 }
 
 static inline void
@@ -727,7 +717,7 @@ during_frag( fd_shred_ctx_t * ctx,
         ctx->pending_batch.txn_cnt        = 0UL;
         ctx->batch_cnt                    = 0UL;
 
-        FD_MCNT_INC( SHRED, MICROBLOCK_ABANDONED, 1UL );
+        FD_MCNT_INC( SHRED, BATCH_ABANDONED, 1UL );
       }
 
       ctx->pending_batch.slot = target_slot;
@@ -1027,6 +1017,8 @@ fan_out( fd_shred_ctx_t *     ctx,
   fd_shred_dest_t * sdest = fd_stake_ci_get_sdest_for_slot( ctx->stake_ci, shreds[ 0 ]->slot );
   if( FD_UNLIKELY( !sdest ) ) return;
 
+  fd_shred_dest_idx_t * _dests = ctx->scratchpad_dests;
+
   ulong out_stride;
   ulong max_dest_cnt[1];
   fd_shred_dest_idx_t * dests;
@@ -1035,14 +1027,19 @@ fan_out( fd_shred_ctx_t *     ctx,
       for( ulong j=0UL; j<ctx->adtl_dests_retransmit_cnt; j++ ) send_shred( ctx, stem, shreds[ i ], ctx->adtl_dests_retransmit+j, tsorig );
     }
     out_stride = k;
-    dests = fd_shred_dest_compute_children( sdest, shreds, k, ctx->scratchpad_dests, k, fanout, fanout, max_dest_cnt );
+    dests = fd_shred_dest_compute_children( sdest, shreds, k, _dests, k, fanout, fanout, max_dest_cnt );
   } else {
     for( ulong i=0UL; i<k; i++ ) {
       for( ulong j=0UL; j<ctx->adtl_dests_leader_cnt; j++ ) send_shred( ctx, stem, shreds[ i ], ctx->adtl_dests_leader+j, tsorig );
     }
-    out_stride = 1UL;
-    *max_dest_cnt = 1UL;
-    dests = fd_shred_dest_compute_first( sdest, shreds, k, ctx->scratchpad_dests );
+    out_stride = k;
+    *max_dest_cnt = 2UL; /* Root of turbine tree and next leader */
+    dests = fd_shred_dest_compute_first( sdest, shreds, k, _dests );
+
+    /* Send leader shreds to the next leader.  At the epoch boundary,
+       this will be a no-op so we don't need to get the other sdest. */
+    fd_shred_dest_idx_t next_leader = fd_shred_dest_leader_for_slot( sdest, shreds[ 0 ]->slot + 4UL );
+    for( ulong i=0UL; i<k; i++ ) _dests[ k+i ] = fd_uint_if( next_leader==_dests[ i ], FD_SHRED_DEST_NO_DEST, next_leader );
   }
   if( FD_UNLIKELY( !dests ) ) return;
 
@@ -1074,45 +1071,45 @@ complete_fec_set( fd_shred_ctx_t *         ctx,
   /* Compute merkle root and chained merkle root. */
 
   int replay_fwd = 1;
+  int again      = 0;
   if( FD_LIKELY( ctx->store ) ) { /* firedancer-only */
 
     set->leader_bank = NULL; /* un-used by firedancer */
 
     fd_hash_t const * mr = fd_type_pun_const( merkle_root );
 
-    fd_store_fec_t * fec;
-    int insert_err = fd_store_insert( ctx->store, ctx->map_join, mr, last->slot, ctx->round_robin_id, &fec );
-    if( FD_UNLIKELY( insert_err==FD_MAP_ERR_KEY ) ) {
-      replay_fwd = 0;
-    } else {
-      FD_TEST( !insert_err && fec );
+    /* The payload is filled before the FEC is linked */
 
+    if( FD_UNLIKELY( fd_store_query( ctx->map_join, mr ) ) ) {
+      again = 1;
+    } else {
       fd_store_fec_spill_stats_t spill[1];
-      uchar * fec_data = fd_store_fec_data_acquire_ex( ctx->store, ctx->disk_fd, fec, spill );
+      uint    data_idx;
+      uchar * fec_data = fd_store_fec_data_reserve( ctx->store, ctx->disk_fd, &data_idx, spill );
       if( FD_UNLIKELY( spill->write_cnt ) ) {
         fd_histf_sample( ctx->metrics->fec_fallback_write_timing, spill->write_ticks );
         ctx->metrics->fec_fallback_write_cnt   += spill->write_cnt;
         ctx->metrics->fec_fallback_write_bytes += spill->write_bytes;
       }
-      if( FD_UNLIKELY( !fec_data ) )
-        FD_LOG_CRIT(( "Store could not allocate a FEC payload" ));
+      if( FD_UNLIKELY( !fec_data ) ) FD_LOG_CRIT(( "Store could not allocate a FEC payload" ));
+      uint   data_sz = 0U;
+      ushort shred_sz[ FD_FEC_SHRED_CNT ];
       for( ulong i=0UL; i<FD_FEC_SHRED_CNT; i++ ) {
         fd_shred_t * data_shred = set->data_shreds[i].s;
         ulong        payload_sz = fd_shred_payload_sz( data_shred );
-        if( FD_UNLIKELY( fec->data_sz + payload_sz > ctx->store->fec_data_max ) ) {
-
-          FD_LOG_CRIT(( "Shred tile %lu: completed FEC set %lu %u data_sz: %lu exceeds data_max: %lu", ctx->round_robin_id, data_shred->slot, data_shred->fec_set_idx, fec->data_sz + payload_sz, ctx->store->fec_data_max ));
+        if( FD_UNLIKELY( data_sz + payload_sz > ctx->store->fec_data_max ) ) {
+          FD_LOG_CRIT(( "Shred tile %lu: completed FEC set %lu %u data_sz: %lu exceeds data_max: %lu", ctx->round_robin_id, data_shred->slot, data_shred->fec_set_idx, data_sz + payload_sz, ctx->store->fec_data_max ));
         }
-        fd_memcpy_nt_nofence( fec_data + fec->data_sz, fd_shred_data_payload( data_shred ), payload_sz );
-        fec->data_sz += (uint)payload_sz;
-        if( FD_LIKELY( i<FD_FEC_SHRED_CNT ) ) {
-          FD_TEST( payload_sz<=USHORT_MAX );
-          fec->shred_sz[ i ] = (ushort)payload_sz;
-        }
+        fd_memcpy_nt_nofence( fec_data + data_sz, fd_shred_data_payload( data_shred ), payload_sz );
+        data_sz += (uint)payload_sz;
+        FD_TEST( payload_sz<=USHORT_MAX );
+        shred_sz[ i ] = (ushort)payload_sz;
       }
       _mm_sfence();
-      fd_store_fec_data_publish( ctx->store, fec );
+      fd_store_fec_t * fec;
+      again = fd_store_insert( ctx->store, ctx->map_join, mr, last->slot, ctx->round_robin_id, data_idx, data_sz, shred_sz, &fec )==FD_MAP_ERR_KEY;
     }
+    replay_fwd = !again || ctx->alpenglow;
   }
 
   if( FD_LIKELY( ctx->shred_out_idx!=ULONG_MAX && replay_fwd ) ) { /* firedancer-only */
@@ -1124,7 +1121,7 @@ complete_fec_set( fd_shred_ctx_t *         ctx,
     FD_STATIC_ASSERT( FD_SHRED_STEM_BURST>=32UL, shred_out_burst );
     ulong missing_chunk[ 32 ];
     ulong missing_cnt = 0UL;
-    for( int i=0; i<32; i++ ) {
+    for( int i=0; !again && i<32; i++ ) {
       if( fd_uint_extract_bit( set->data_shred_rcvd, i )==0 ) {
         fd_shred_t * const missing = &set->data_shreds[ i ].s[0];
 
@@ -1155,7 +1152,7 @@ complete_fec_set( fd_shred_ctx_t *         ctx,
        completed by the singular coding shred, and that also happens
        to evict a FEC set from the curr_map.  When fix-32 arrives, the
        link burst value can be lowered to 2. */
-    ulong sig = is_leader ? SHRED_SIG_FEC_COMPLETE_LEADER : SHRED_SIG_FEC_COMPLETE;
+    ulong sig = again ? SHRED_SIG_FEC_COMPLETE_AGAIN : ( is_leader ? SHRED_SIG_FEC_COMPLETE_LEADER : SHRED_SIG_FEC_COMPLETE );
 
     fd_fec_complete_t * complete_msg = fd_chunk_to_laddr( ctx->shred_out_mem, ctx->shred_out_chunk );
     complete_msg->last_shred_hdr = *last;
@@ -1506,10 +1503,7 @@ unprivileged_init( fd_topo_t const *      topo,
     FD_TEST( ctx->store->magic==FD_STORE_MAGIC );
     FD_TEST( fd_store_map_ljoin( ctx->store, ctx->map_join ) );
   }
-  /* With rserve disabled, shred:0 remains responsible for punching
-     reclaimed spill pages, and will charge busy. */
-  ctx->store_maintenance = !!ctx->store && !ctx->round_robin_id &&
-                           fd_topo_find_tile( topo, "rserve", 0UL )==ULONG_MAX;
+  ctx->alpenglow = tile->shred.alpenglow;
 
   /* If the default partial_depth is ever changed, correspondingly
      change the size of the fd_fec_intra_pool in fd_fec_repair. */
@@ -1625,7 +1619,9 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->resolver = NONNULL( fd_fec_resolver_join ( fd_fec_resolver_new ( _resolver,
                                                                         tile->shred.fec_resolver_depth, 1UL,
                                                                         fec_exposure+1UL,
-                                                                        128UL * tile->shred.fec_resolver_depth, resolver_sets,
+                                                                        128UL * tile->shred.fec_resolver_depth,
+                                                                        tile->shred.alpenglow ? tile->shred.slot_max : 0UL,
+                                                                        resolver_sets,
                                                                         ctx->resolver_seed ) ) );
 
   if( FD_LIKELY( !!expected_shred_version ) ) {
@@ -1727,19 +1723,15 @@ unprivileged_init( fd_topo_t const *      topo,
 
   ctx->leader_bank  = NULL;
 
-  fd_histf_join( fd_histf_new( ctx->metrics->contact_info_cnt,     FD_MHIST_MIN(         SHRED, CONTACT_INFO_PER_MESSAGE   ),
-                                                                   FD_MHIST_MAX(         SHRED, CONTACT_INFO_PER_MESSAGE   ) ) );
+  fd_histf_join( fd_histf_new( ctx->metrics->contact_info_cnt,     FD_MHIST_MIN(         SHRED, DEST_PER_UPDATE            ),
+                                                                   FD_MHIST_MAX(         SHRED, DEST_PER_UPDATE            ) ) );
   fd_histf_join( fd_histf_new( ctx->metrics->batch_sz,             FD_MHIST_MIN(         SHRED, BATCH_SIZE_BYTES           ),
                                                                    FD_MHIST_MAX(         SHRED, BATCH_SIZE_BYTES           ) ) );
   fd_histf_join( fd_histf_new( ctx->metrics->batch_microblock_cnt, FD_MHIST_MIN(         SHRED, MICROBLOCK_PER_BATCH       ),
                                                                    FD_MHIST_MAX(         SHRED, MICROBLOCK_PER_BATCH       ) ) );
-  fd_histf_join( fd_histf_new( ctx->metrics->shredding_timing,     FD_MHIST_SECONDS_MIN( SHRED, SHREDDING_DURATION_SECONDS ),
-                                                                   FD_MHIST_SECONDS_MAX( SHRED, SHREDDING_DURATION_SECONDS ) ) );
-  fd_histf_join( fd_histf_new( ctx->metrics->add_shred_timing,     FD_MHIST_SECONDS_MIN( SHRED, ADD_SHRED_DURATION_SECONDS ),
-                                                                   FD_MHIST_SECONDS_MAX( SHRED, ADD_SHRED_DURATION_SECONDS ) ) );
-  fd_histf_join( fd_histf_new( ctx->metrics->fec_fallback_write_timing,
-                               FD_MHIST_SECONDS_MIN( SHRED, FEC_FALLBACK_WRITE_SECONDS ),
-                               FD_MHIST_SECONDS_MAX( SHRED, FEC_FALLBACK_WRITE_SECONDS ) ) );
+  fd_histf_join( fd_metrics_histf_new_ns( ctx->metrics->shredding_timing,     FD_MHIST_EDGES_NS( SHRED, BATCH_SHRED_DURATION_NANOS ) ) );
+  fd_histf_join( fd_metrics_histf_new_ns( ctx->metrics->add_shred_timing,     FD_MHIST_EDGES_NS( SHRED, ADD_SHRED_DURATION_NANOS ) ) );
+  fd_histf_join( fd_metrics_histf_new_ns( ctx->metrics->fec_fallback_write_timing, FD_MHIST_EDGES_NS( SHRED, STORE_FEC_SYNC_SPILL_DURATION_NANOS ) ) );
   memset( ctx->metrics->shred_processing_result, '\0', sizeof(ctx->metrics->shred_processing_result) );
   ctx->metrics->invalid_block_id_cnt         = 0UL;
   ctx->metrics->shred_rejected_unchained_cnt = 0UL;
@@ -1825,7 +1817,6 @@ populate_allowed_fds( fd_topo_t const *      topo,
 
 #define STEM_CALLBACK_DURING_HOUSEKEEPING during_housekeeping
 #define STEM_CALLBACK_METRICS_WRITE       metrics_write
-#define STEM_CALLBACK_AFTER_CREDIT        after_credit
 #define STEM_CALLBACK_BEFORE_FRAG         before_frag
 #define STEM_CALLBACK_DURING_FRAG         during_frag
 #define STEM_CALLBACK_AFTER_FRAG          after_frag

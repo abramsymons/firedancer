@@ -536,10 +536,10 @@ check_cert_wire( char const *         name,
   FD_TEST( buf[ off ]==kind     ); off += 1UL;
   FD_TEST( FD_LOAD( ulong, buf+off )==slot ); off += 8UL;
   if( block_id ) { FD_TEST( !memcmp( buf+off, block_id, sizeof(ag_block_hash_t) ) ); off += sizeof(ag_block_hash_t); }
-  fd_bls_sig_t exp_sig[1]; *exp_sig = agg->sig;
+  blst_p2 exp_sig[1]; *exp_sig = agg->sig;
   if( agg2 ) blst_p2_add_or_double( exp_sig, exp_sig, &agg2->sig );
   uchar exp_bytes[ FD_BLS_SIG_SZ ];
-  { blst_p2_affine a[1]; blst_p2_to_affine( a, exp_sig ); blst_p2_affine_serialize( exp_bytes, a ); }
+  { fd_bls_sig_t a[1]; blst_p2_to_affine( a, exp_sig ); blst_p2_affine_serialize( exp_bytes, a ); }
   FD_TEST( !memcmp( buf+off, exp_bytes, FD_BLS_SIG_SZ ) ); off += FD_BLS_SIG_SZ;
   FD_TEST( FD_LOAD( ulong, buf+off )==CERT_BITMAP_HDR_SZ+bitmap_sz ); off += 8UL;
   FD_TEST( off==hdr );
@@ -717,9 +717,9 @@ test_wire_not_g2( void ) {
   ulong          one[6] = { 1UL }, four[6] = { 4UL };
   blst_fp        fp1[1];
   blst_fp2       b[1], t[1];
-  blst_p2_affine bad[1];
+  fd_bls_sig_t   bad[1];
   uchar          bad_bytes[ FD_BLS_SIG_SZ ];
-  memset( bad, 0, sizeof(blst_p2_affine) );
+  memset( bad, 0, sizeof(fd_bls_sig_t) );
   blst_fp_from_uint64( fp1, one );
   blst_fp_from_uint64( &b->fp[0], four ); b->fp[1] = b->fp[0];
   do {
@@ -748,6 +748,32 @@ test_wire_not_g2( void ) {
   free( em );
 }
 
+static void
+test_wire_compressed( void ) {
+  ulong n = 11UL;
+  create_signers( n );
+  void * em; ag_epoch_info_t * e = make_epoch( n, &em );
+  ag_block_hash_t h; memset( h, 0x42, sizeof(ag_block_hash_t) );
+
+  ag_vote_notar_t nv[ 11 ];
+  ag_cert_t       c, rt;
+  uchar           buf[ AG_CERT_SER_MAX ];
+  ulong           bit_cnt;
+
+  mk_notar( nv, 7UL, h, 0UL, 9UL );
+  c = cert_build_notar( nv, 9UL, e );
+  ulong   sz  = ag_cert_ser( &c, buf );
+  uchar * sig = buf+CERT_HDR_SZ( 1 )-8UL-FD_BLS_SIG_SZ;
+  FD_TEST( ag_cert_de( &rt, &bit_cnt, buf, sz )==AG_CERT_DE_SUCCESS );
+  blst_p2_compress( sig, &rt.notar.agg.sig );
+  fd_memset( sig+FD_BLS_SIG_COMPRESSED_SZ, 0xEE, FD_BLS_SIG_SZ-FD_BLS_SIG_COMPRESSED_SZ );
+  FD_TEST( sig[0]&0x80U );
+  FD_TEST( ag_cert_de( &rt, &bit_cnt, buf, sz )==AG_CERT_DE_SUCCESS );
+  FD_TEST( cert_verify( &rt, e ) );
+
+  free( em );
+}
+
 int
 main( int     argc,
       char ** argv ) {
@@ -761,6 +787,7 @@ main( int     argc,
   test_wire_golden();
   test_wire_verify();
   test_wire_not_g2();
+  test_wire_compressed();
 
   FD_LOG_NOTICE(( "pass" ));
   fd_halt();

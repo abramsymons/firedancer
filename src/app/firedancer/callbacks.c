@@ -5,6 +5,7 @@
 #include "../../flamenco/runtime/fd_bank.h"
 #include "../../flamenco/runtime/fd_txncache_shmem.h"
 #include "../../flamenco/progcache/fd_progcache.h"
+#include "../../flamenco/alpenglow/fd_footer_cache.h"
 #include "../../disco/shred/fd_rnonce_ss.h"
 #include "../../discof/backup/fd_backup_shmem.h"
 
@@ -18,7 +19,7 @@
 static ulong
 banks_footprint( fd_topo_t const *     topo,
                  fd_topo_obj_t const * obj ) {
-  return fd_banks_footprint( VAL("max_live_slots"), VAL("max_fork_width"), FD_RUNTIME_MAX_STAKE_ACCOUNTS, FD_RUNTIME_MAX_VAT_VOTE_ACCOUNTS );
+  return fd_banks_footprint( VAL("max_live_slots"), VAL("cache_cnt"), VAL("stake_delegation_cache_cnt"), FD_RUNTIME_MAX_VAT_VOTE_ACCOUNTS );
 }
 
 static ulong
@@ -31,7 +32,7 @@ static void
 banks_new( fd_topo_t const *     topo,
            fd_topo_obj_t const * obj ) {
   ulong seed = fd_pod_queryf_ulong( topo->props, 0UL, "obj.%lu.seed", obj->id );
-  FD_TEST( fd_banks_new( fd_topo_obj_laddr( topo, obj->id ), FD_STAKE_DELEGATIONS_FD, VAL("max_live_slots"), VAL("max_fork_width"), FD_RUNTIME_MAX_STAKE_ACCOUNTS, FD_RUNTIME_MAX_STAKE_DELEGATION_DISK_RECORDS, FD_RUNTIME_MAX_VAT_VOTE_ACCOUNTS, VAL("bench_max_cost_per_block"), seed ) );
+  FD_TEST( fd_banks_new( fd_topo_obj_laddr( topo, obj->id ), FD_STAKE_DELEGATIONS_FD, VAL("max_live_slots"), VAL("cache_cnt"), VAL("stake_delegation_cache_cnt"), FD_RUNTIME_MAX_STAKE_DELEGATION_DISK_RECORDS, FD_RUNTIME_MAX_VAT_VOTE_ACCOUNTS, VAL("bench_max_cost_per_block"), seed ) );
 }
 
 fd_topo_obj_callbacks_t fd_obj_cb_banks = {
@@ -201,6 +202,31 @@ fd_topo_obj_callbacks_t fd_obj_cb_txncache = {
   .footprint = txncache_footprint,
   .align     = txncache_align,
   .new       = txncache_new,
+};
+
+static ulong
+footer_cache_footprint( fd_topo_t const *     topo FD_FN_UNUSED,
+                        fd_topo_obj_t const * obj  FD_FN_UNUSED ) {
+  return fd_footer_cache_footprint();
+}
+
+static ulong
+footer_cache_align( fd_topo_t const *     topo FD_FN_UNUSED,
+                    fd_topo_obj_t const * obj  FD_FN_UNUSED ) {
+  return fd_footer_cache_align();
+}
+
+static void
+footer_cache_new( fd_topo_t const *     topo,
+                  fd_topo_obj_t const * obj ) {
+  FD_TEST( fd_footer_cache_new( fd_topo_obj_laddr( topo, obj->id ) ) );
+}
+
+fd_topo_obj_callbacks_t fd_obj_cb_footer_cache = {
+  .name      = "footer_cache",
+  .footprint = footer_cache_footprint,
+  .align     = footer_cache_align,
+  .new       = footer_cache_new,
 };
 
 static ulong
