@@ -96,6 +96,7 @@ struct scenario {
   ulong        crash_idx_mask;     /* by node index: crash at crash_at, like restart_mask */
   ulong        lost_tail;          /* finalized log entries lost at the crash (an unsynced ledger tail) */
   int          root_vote;          /* the last node sends everyone a signed skip vote on the finalized root slot at start */
+  int          crash_voted;        /* crash only once every crashing node has signed a vote (2: a final vote) above its finalized slot */
 };
 typedef struct scenario scenario_t;
 
@@ -138,6 +139,8 @@ struct sim_node {
   ulong           blocks_sz;
   ulong           blocks_max;
   ulong           block_floor;
+  ulong           last_vote_slot;  /* highest slot it signed a vote for */
+  ulong           last_final_slot; /* highest slot it signed a final vote for */
   uchar           last_proof[ VSEQ_PROOF_MAX ];
   ulong           last_proof_sz;
   track_t *       track;        /* TRACK_MAX entries */
@@ -274,8 +277,10 @@ sim_persist_vote( void *        ctx,
                   ulong         sz,
                   uchar const * block,
                   ulong         block_sz ) {
-  (void)slot;
   sim_node_t * sn = ctx;
+  sn->last_vote_slot = fd_ulong_max( sn->last_vote_slot, slot );
+  ag_vote_t v;
+  if( !ag_vote_de( &v, vote, sz ) && v.kind==AG_VOTE_KIND_FINAL ) sn->last_final_slot = fd_ulong_max( sn->last_final_slot, slot );
   if( block ) append( &sn->blocks, &sn->blocks_sz, &sn->blocks_max, block, block_sz );
   append( &sn->votes, &sn->votes_sz, &sn->votes_max, vote, sz );
 }
@@ -608,6 +613,7 @@ run( scenario_t const * sc,
   long next_tx = sc->tx_per_sec ? SEC : LONG_MAX;
   long crash   = sim->restart_mask ? SEC+sc->crash_at   : LONG_MAX;
   long restart = sim->restart_mask ? SEC+sc->restart_at : LONG_MAX;
+  int  crash_armed = 0;
   for(;;) {
     long t = fd_long_min( next_tx, fd_long_min( crash, restart ) );
     if( msgq_cnt( sim->msgq ) ) t = fd_long_min( t, sim->msgq[0].timeout );
@@ -626,7 +632,29 @@ run( scenario_t const * sc,
       free( msg.buf );
     }
     while( next_tx<=sim->now ) { inject_tx( sim ); next_tx += tx_step; }
+    for( ulong r=0UL; r<sim->n; r++ ) {
+      sim_node_t * sn = &sim->nodes[r];
+      if( sn->down || ( !sn->dirty && sn->deadline>sim->now ) ) continue;
+      sn->deadline = fd_long_max( vseq_node_service( sn->node, sim->now ), sim->now+1L );
+      sn->dirty    = 0;
+    }
+    if( FD_UNLIKELY( crash_armed ) ) crash = sim->now;
     if( FD_UNLIKELY( sim->now>=crash ) ) {
+      /* A crash at a fixed time tends to land between a slot's
+         finalization and the next block, when the node has no vote
+         above its root.  crash_voted waits for the moment that
+         matters: votes signed for slots not yet finalized. */
+      if( sc->crash_voted ) {
+        int voted = 1;
+        for( ulong r=0UL; r<sim->n; r++ ) {
+          sim_node_t const * sn = &sim->nodes[r];
+          if( !( sim->restart_mask & (1UL<<r) ) || sn->down ) continue;
+          voted &= ( sc->crash_voted==2 ? sn->last_final_slot : sn->last_vote_slot )>vseq_node_delivered_slot( sn->node );
+        }
+        crash_armed = 1;
+        if( !voted ) { crash = LONG_MAX; continue; } /* checked again after every event */
+        restart = sim->now + ( sc->restart_at-sc->crash_at );
+      }
       for( ulong r=0UL; r<sim->n; r++ ) {
         sim_node_t * sn = &sim->nodes[r];
         if( !( sim->restart_mask & (1UL<<r) ) || sn->down ) continue;
@@ -645,7 +673,8 @@ run( scenario_t const * sc,
         sn->node = NULL;
         sn->down = 1;
       }
-      crash = LONG_MAX;
+      crash       = LONG_MAX;
+      crash_armed = 0;
     }
     if( FD_UNLIKELY( sim->now>=restart ) ) {
       for( ulong r=0UL; r<sim->n; r++ ) {
@@ -658,12 +687,6 @@ run( scenario_t const * sc,
                         sc->name, r, vseq_node_delivered_slot( sn->node ), m->votes_restored, vseq_node_quiet_until( sn->node ) ));
       }
       restart = LONG_MAX;
-    }
-    for( ulong r=0UL; r<sim->n; r++ ) {
-      sim_node_t * sn = &sim->nodes[r];
-      if( sn->down || ( !sn->dirty && sn->deadline>sim->now ) ) continue;
-      sn->deadline = fd_long_max( vseq_node_service( sn->node, sim->now ), sim->now+1L );
-      sn->dirty    = 0;
     }
   }
 
@@ -751,6 +774,10 @@ run( scenario_t const * sc,
     vseq_node_metrics_t const * m = vseq_node_metrics( sn->node );
     FD_LOG_NOTICE(( "[%s]   restarted peer %lu: finalized slot %lu, after restart %lu votes restored, %lu withheld as conflicting, %lu blocks withheld",
                     sc->name, r, vseq_node_delivered_slot( sn->node ), m->votes_restored, m->votes_withheld, m->blocks_withheld ));
+    if( FD_UNLIKELY( sc->crash_voted && !m->votes_restored ) ) {
+      FD_LOG_WARNING(( "[%s] COVERAGE: peer %lu restarted with no vote to restore; the scenario did not test the restore path", sc->name, r ));
+      sim->fail = 1;
+    }
   }
   if( FD_UNLIKELY( sim->conflicts ) ) {
     FD_LOG_WARNING(( "[%s] SAFETY: %lu conflicting votes or blocks", sc->name, sim->conflicts ));
@@ -810,10 +837,20 @@ static scenario_t const scenarios[] = {
                                       .lat_min = 20*MS,  .lat_max = 60*MS,  .duration = 60*SEC, .tx_per_sec = 200, .min_delivered = 100 },
   { .name = "restart-conflict", .node_cnt = 5, .restart_mask = 1UL<<2, .crash_at = 20*SEC, .restart_at = 20*SEC+300*MS, .inject_skips = 8,
                                       .lat_min = 20*MS,  .lat_max = 60*MS,  .duration = 60*SEC, .tx_per_sec = 200, .min_delivered = 100 },
+  /* The crash lands while votes above the root exist: the restore path
+     with real notar and final votes, not injected skips */
+  { .name = "restart-voted", .node_cnt = 5, .restart_mask = 1UL<<2, .crash_at = 20*SEC, .restart_at = 20*SEC+300*MS, .crash_voted = 1,
+                                      .lat_min = 20*MS,  .lat_max = 60*MS,  .duration = 60*SEC, .tx_per_sec = 200, .min_delivered = 100 },
+  { .name = "restart-final-voted", .node_cnt = 5, .restart_mask = 1UL<<2, .crash_at = 20*SEC, .restart_at = 20*SEC+300*MS, .crash_voted = 2,
+                                      .lat_min = 20*MS,  .lat_max = 60*MS,  .duration = 60*SEC, .tx_per_sec = 200, .min_delivered = 100 },
+  { .name = "restart-voted-slow", .node_cnt = 5, .restart_mask = 1UL<<2, .crash_at = 20*SEC, .restart_at = 26*SEC, .crash_voted = 1,
+                                      .lat_min = 20*MS,  .lat_max = 60*MS,  .duration = 60*SEC, .tx_per_sec = 200, .min_delivered = 100 },
   { .name = "restart-all",  .node_cnt = 5, .restart_mask = 0x1fUL, .crash_at = 20*SEC, .restart_at = 21*SEC,
                                       .lat_min = 20*MS,  .lat_max = 60*MS,  .duration = 60*SEC, .tx_per_sec = 200, .min_delivered = 100 },
   /* Every node also loses the last slot_max/2 finalized blocks, the
      most vseqd lets the ledger fall behind the vote history */
+  { .name = "restart-all-voted", .node_cnt = 5, .restart_mask = 0x1fUL, .crash_at = 20*SEC, .restart_at = 21*SEC, .crash_voted = 1,
+                                      .lat_min = 20*MS,  .lat_max = 60*MS,  .duration = 60*SEC, .tx_per_sec = 200, .min_delivered = 100 },
   { .name = "restart-all-lost-tail", .node_cnt = 5, .restart_mask = 0x1fUL, .crash_at = 20*SEC, .restart_at = 21*SEC, .lost_tail = 16,
                                       .lat_min = 20*MS,  .lat_max = 60*MS,  .duration = 60*SEC, .tx_per_sec = 200, .min_delivered = 100 },
   /* Node 0 leaves and node 5 joins at slot 64.  Then nodes 0-2 crash:

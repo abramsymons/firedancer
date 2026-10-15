@@ -271,7 +271,7 @@ FLOOR), compacted to those above the finalized root.
 
 | Test | Covers |
 |---|---|
-| `test_vseq_sim` | loss, latency, crashes, equivocation, restarts of one or all nodes, set changes, uneven stake |
+| `test_vseq_sim` | loss, latency, crashes, equivocation, restarts of one or all nodes (also timed while votes above the root exist, so they are restored), set changes, uneven stake |
 | `test_vseq_ledger` | segment crash recovery, pruning, the read-only follower |
 | `sdk/python/tests/test_sdk.py` | proof checks, tampered data, lying nodes, API keys |
 | `test_vseqd_cluster.py` | real processes: kill, restart, restart all, rejoin with an empty ledger, pruning |
