@@ -113,13 +113,17 @@ def main():
         done = threading.Event()
 
         def reader():
-            for blk in vs.batches(after=vs.get_last_finalized(), poll_interval=0.0005):
-                now = time.time()
-                for tx in blk.txs:
-                    if tx[:2] == MAGIC:
-                        seen.setdefault(struct.unpack_from("<Q", tx, 2)[0], now)
-                if done.is_set():
-                    return
+            try:
+                for blk in vs.batches(after=vs.get_last_finalized(), poll_interval=0.0005):
+                    now = time.time()
+                    for tx in blk.txs:
+                        if tx[:2] == MAGIC:
+                            seen.setdefault(struct.unpack_from("<Q", tx, 2)[0], now)
+                    if done.is_set():
+                        return
+            except Exception:
+                if not done.is_set():  # the nodes stopping after the run is expected
+                    raise
 
         threading.Thread(target=reader, daemon=True).start()
         out = mp.Queue()
