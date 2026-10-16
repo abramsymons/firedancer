@@ -55,6 +55,10 @@ them, see [DESIGN.md](DESIGN.md).
 
 ## Quick start
 
+Building needs only gcc and make (on Ubuntu: `apt install
+build-essential`) and Python 3.11+ for the SDK and tests. Everything else,
+BLS included, is in the tree; `./deps.sh` is not needed.
+
 ```bash
 make -j vseqd libvseq_client.so
 O=$(make --silent objdir)
@@ -114,6 +118,22 @@ make -j BUILDDIR=clang-fuzz-asan CC=clang EXTRAS="fuzz asan" fuzz_vseq
 FUZZ_VSEQ_SEED_DIR=corpus/fuzz_vseq build/clang-fuzz-asan/fuzz-test/fuzz_vseq -runs=0
 build/clang-fuzz-asan/fuzz-test/fuzz_vseq -max_total_time=600 corpus/fuzz_vseq
 ```
+
+## Benchmark
+
+`bench_vseqd.py` starts a local cluster, sends txs at a fixed rate with
+the SDK and prints the time from send to verified final:
+
+```bash
+python3 src/app/vseq/bench_vseqd.py --vseqd $O/bin/vseqd --lib $O/lib/libvseq_client.so \
+        --nodes 5 --slot-ms 10 --rate 10000 --tx-size 100
+```
+
+On a 16 vCPU VM with NVMe-backed disk, 5 nodes with 10 ms slots: p50
+13 ms, p99 21 ms at 400 tx/s of 256 B; p50 14 ms, p99 36 ms at 10k tx/s
+of 100 B. Every vote is fsynced first, so the disk sets the tail: on a
+consumer SSD that stalls under sustained fsyncs, p99 reaches hundreds
+of ms.
 
 ## Status
 
