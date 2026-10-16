@@ -337,7 +337,7 @@ cluster_read( cluster_t *  c,
   if( FD_UNLIKELY( genesis_ms<0L ) ) FD_LOG_ERR(( "%s: genesis_time_ms must not be negative", path ));
   c->genesis_ns   = genesis_ms*1000000L;
   if( FD_UNLIKELY( network_id<1L || network_id>65535L ) ) FD_LOG_ERR(( "%s: network_id must be in [1,65535]", path ));
-  if( FD_UNLIKELY( slot_ms<50L || slot_ms>60000L      ) ) FD_LOG_ERR(( "%s: slot_ms must be in [50,60000]", path ));
+  if( FD_UNLIKELY( slot_ms<10L || slot_ms>60000L      ) ) FD_LOG_ERR(( "%s: slot_ms must be in [10,60000]", path ));
   if( FD_UNLIKELY( payload<1024L || payload>(16L<<20) ) ) FD_LOG_ERR(( "%s: payload_max must be in [1024,16777216]", path ));
   c->network_id  = (ushort)network_id;
   c->slot_ns     = slot_ms*1000L*1000L;
