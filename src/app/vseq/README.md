@@ -140,6 +140,47 @@ and the client on the first, 10 ms slots, 10k tx/s of 100 B: p50 14 ms,
 p99 24 ms. With `--local-read` the client reads node 0's ledger files
 every 1 ms, unverified, instead of `/blocks`: p50 12.5 ms, p99 21.5 ms.
 
+### On several machines
+
+One node per machine, the client on one of them. The machines need the
+same commit built, clocks synced (NTP), and ports 9000 (nodes), 8000
+(API) and 8500 (blocks) open between them.
+
+1. On any machine, make the cluster files, with genesis a minute out,
+   and put each machine's address in them (here 4 machines):
+
+   ```bash
+   $O/bin/vseqd gen-cluster --nodes 4 --dir c --genesis-delay-s 60
+   python3 - c/cluster.toml 10.0.0.1 10.0.0.2 10.0.0.3 10.0.0.4 <<'PY'
+   import re, sys
+   path, hosts = sys.argv[1], sys.argv[2:]
+   parts = re.sub(r"(?m)^slot_ms\s*=.*$", "slot_ms = 10", open(path).read()).split("[[validator]]")
+   for i, h in enumerate(hosts):
+       parts[i + 1] = re.sub(r'(?m)^host\s*=.*$', f'host = "{h}"', parts[i + 1])
+       parts[i + 1] = re.sub(r'(?m)^port\s*=.*$', 'port = 9000', parts[i + 1])
+       parts[i + 1] = re.sub(r'(?m)^api\s*=.*$', f'api = "http://{h}:8000"', parts[i + 1])
+       parts[i + 1] = re.sub(r'(?m)^blocks\s*=.*$', f'blocks = "http://{h}:8500"', parts[i + 1])
+   open(path, "w").write("[[validator]]".join(parts))
+   PY
+   ```
+
+2. Copy `c/cluster.toml` to every machine and `c/node-i.toml` to machine
+   i, then start both processes on each, before genesis:
+
+   ```bash
+   $O/bin/vseqd run    --cluster cluster.toml --key node-i.toml --ledger ledger --api-port 8000 &
+   $O/bin/vseqd blocks --cluster cluster.toml --ledger ledger --port 8500 &
+   ```
+
+3. On machine 0, once all nodes run, benchmark the running cluster:
+
+   ```bash
+   python3 src/app/vseq/bench_vseqd.py --cluster cluster.toml --lib $O/lib/libvseq_client.so \
+           --rate 10000 --tx-size 100 --secs 3 [--local-read ledger]
+   ```
+
+Stop the nodes with `kill %1 %2` (or Ctrl-C) on each machine.
+
 ## Status
 
 A prototype, not production ready. Known gaps:
