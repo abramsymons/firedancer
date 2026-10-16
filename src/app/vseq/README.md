@@ -135,6 +135,11 @@ of 100 B. Every vote is fsynced first, so the disk sets the tail: on a
 consumer SSD that stalls under sustained fsyncs, p99 reaches hundreds
 of ms.
 
+On 4 VMs in one datacenter (4 vCPU each, 0.2 ms apart), one node per VM
+and the client on the first, 10 ms slots, 10k tx/s of 100 B: p50 14 ms,
+p99 24 ms. With `--local-read` the client reads node 0's ledger files
+every 1 ms, unverified, instead of `/blocks`: p50 12.5 ms, p99 21.5 ms.
+
 ## Status
 
 A prototype, not production ready. Known gaps:

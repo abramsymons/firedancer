@@ -8,7 +8,7 @@ took from send to final:
 
   bench_vseqd.py --vseqd PATH --lib PATH [--nodes 5] [--slot-ms 10]
                  [--rate 400] [--tx-size 256] [--secs 5] [--batch-ms 5]
-                 [--dir DIR]
+                 [--local-read] [--dir DIR]
 
 The sender runs in its own process; one Python process sends up to
 about 10k tx/s.  All nodes share this machine's disk: a disk with slow
@@ -65,6 +65,8 @@ def main():
     ap.add_argument("--tx-size", type=int, default=256)
     ap.add_argument("--secs", type=float, default=5)
     ap.add_argument("--batch-ms", type=float, default=5, help="send the txs of this long in one call")
+    ap.add_argument("--local-read", action="store_true",
+                    help="read node 0's ledger files every 1 ms, unverified, instead of /blocks over HTTP")
     ap.add_argument("--dir", default=None)
     ap.add_argument("--base-port", type=int, default=19000)
     ap.add_argument("--api-base-port", type=int, default=18000)
@@ -114,7 +116,8 @@ def main():
 
         def reader():
             try:
-                for blk in vs.batches(after=vs.get_last_finalized(), poll_interval=0.0005):
+                ledger = f"{d}/ledger-0" if args.local_read else None
+                for blk in vs.batches(after=vs.get_last_finalized(), poll_interval=0.001 if ledger else 0.0005, ledger=ledger):
                     now = time.time()
                     for tx in blk.txs:
                         if tx[:2] == MAGIC:

@@ -181,6 +181,11 @@ class _Lib:
         self.lib.vseq_client_verify.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_char_p,
                                                 ctypes.c_char_p, ctypes.c_ulong]
         self.lib.vseq_client_verify.restype = ctypes.c_int
+        self.lib.vseq_client_ledger_follow.argtypes = [ctypes.c_char_p]
+        self.lib.vseq_client_ledger_follow.restype = ctypes.c_void_p
+        self.lib.vseq_client_ledger_read.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong]
+        self.lib.vseq_client_ledger_read.restype = ctypes.c_long
+        self.lib.vseq_client_ledger_close.argtypes = [ctypes.c_void_p]
         blob = b"".join(struct.pack("<Q", v.stake) + v.identity + v.bls +
                         struct.pack("<QQ", v.from_epoch, 2**64 - 1 if v.until_epoch is None else v.until_epoch)
                         for v in network.validators)
@@ -427,14 +432,21 @@ class Vseq:
                 continue
         raise NetworkError("no node returned a verifiable finalized block")
 
-    def batches(self, after=None, poll_interval=0.2, deadline=None):
+    def batches(self, after=None, poll_interval=0.2, deadline=None, ledger=None):
         """Yield verified finalized blocks after the block `after`, forever.
 
         after is a Block you already trust (from get_last_finalized() or
         an earlier batch); None starts from genesis.  Empty (skipped)
         slots produce no block.  Stops at deadline (time.time()) if set.
+
+        With ledger set to a node's ledger directory (vseqd run --ledger)
+        on this machine, the blocks are read from its files instead of
+        over HTTP, and are not verified: the node is trusted.
         """
         anchor = after or GENESIS
+        if ledger:
+            yield from self._local_batches(anchor, ledger, poll_interval, deadline)
+            return
         while deadline is None or time.time() < deadline:
             blocks = self._fetch(anchor)
             if not blocks:
@@ -443,3 +455,28 @@ class Vseq:
             for blk in blocks:
                 yield blk
             anchor = blocks[-1]
+
+    def _local_batches(self, anchor, ledger, poll_interval, deadline):
+        lib, buf, h = self._lib.lib, ctypes.create_string_buffer(32 << 20), None  # buf fits any record
+        try:
+            while deadline is None or time.time() < deadline:
+                if not h:
+                    h = lib.vseq_client_ledger_follow(ledger.encode())
+                n = lib.vseq_client_ledger_read(h, anchor.slot, buf, len(buf)) if h else 0
+                if n == -1:  # the ledger was replaced: open it again
+                    lib.vseq_client_ledger_close(h)
+                    h = None
+                    continue
+                if n < 0:
+                    raise NetworkError(f"{ledger}: " + ("history after slot was pruned" if n == -2 else "record too large"))
+                raw = decode_blocks(ctypes.string_at(buf, n))[1] if n else []
+                if not raw:
+                    time.sleep(poll_interval)
+                    continue
+                for r in raw:
+                    anchor = Block(slot=r.slot, hash=r.hash, parent_slot=r.parent_slot, parent_hash=r.parent_hash,
+                                   txs=payload_txs(r.payload))
+                    yield anchor
+        finally:
+            if h:
+                lib.vseq_client_ledger_close(h)

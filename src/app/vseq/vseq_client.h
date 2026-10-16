@@ -62,6 +62,33 @@ vseq_client_verify( vseq_client_t * client,
                     uchar const *   certs,
                     ulong           certs_sz );
 
+/* Local reader: a client on a node's machine reads the node's ledger
+   directory (vseqd run --ledger DIR) directly, like vseqd blocks does,
+   without HTTP.  The node is trusted: nothing read is verified.
+
+   vseq_client_ledger_follow returns NULL if dir has no ledger yet.
+
+   vseq_client_ledger_read catches up with the node and copies the
+   records after slot into out, in the /blocks response format (see
+   vseqd.c).  Returns the byte size (a 20 byte header and no records if
+   nothing is newer), -1 if the ledger was replaced or damaged (close
+   and follow it again), -2 if history after slot was pruned, -3 if out
+   is too small for the next record. */
+
+typedef struct vseq_ledger vseq_ledger_t;
+
+vseq_ledger_t *
+vseq_client_ledger_follow( char const * dir );
+
+long
+vseq_client_ledger_read( vseq_ledger_t * ledger,
+                         ulong           after,
+                         uchar *         out,
+                         ulong           out_max );
+
+void
+vseq_client_ledger_close( vseq_ledger_t * ledger );
+
 FD_PROTOTYPES_END
 
 #endif /* HEADER_fd_src_app_vseq_vseq_client_h */

@@ -1,4 +1,5 @@
 #include "vseq_client.h"
+#include "vseq_ledger.h"
 #include "vseq_node.h"
 #include "vseq_proof.h"
 
@@ -88,4 +89,36 @@ vseq_client_verify( vseq_client_t * client,
                     uchar const *   certs,
                     ulong           certs_sz ) {
   return vseq_proof_verify( vseq_sched_set( client->sched, slot )->epoch, client->network_id, slot, hash, certs, certs_sz, &client->cert );
+}
+
+#define LEDGER_PAYLOAD_MAX (16UL<<20) /* the largest payload_max a cluster can set */
+#define BLOCKS_HDR_SZ      (20UL)
+
+vseq_ledger_t *
+vseq_client_ledger_follow( char const * dir ) {
+  boot_once();
+  return vseq_ledger_follow( dir, LEDGER_PAYLOAD_MAX, VSEQ_PROOF_MAX );
+}
+
+long
+vseq_client_ledger_read( vseq_ledger_t * ledger,
+                         ulong           after,
+                         uchar *         out,
+                         ulong           out_max ) {
+  if( FD_UNLIKELY( out_max<BLOCKS_HDR_SZ ) ) return -3L;
+  if( FD_UNLIKELY( vseq_ledger_refresh( ledger ) ) ) return -1L;
+  if( FD_UNLIKELY( after<vseq_ledger_base( ledger ).slot ) ) return -2L;
+  ulong first = vseq_ledger_first_after( ledger, after );
+  ulong cnt;
+  ulong sz    = vseq_ledger_read_span( ledger, first, ULONG_MAX, ULONG_MAX, out+BLOCKS_HDR_SZ, out_max-BLOCKS_HDR_SZ, &cnt );
+  if( FD_UNLIKELY( !cnt && first<vseq_ledger_cnt( ledger ) ) ) return -3L;
+  memcpy( out, "VSQB\1\0\0\0", 8UL );
+  FD_STORE( ulong, out+ 8UL, 0UL ); /* finalized slot: not tracked here */
+  FD_STORE( uint,  out+16UL, (uint)cnt );
+  return (long)( BLOCKS_HDR_SZ+sz );
+}
+
+void
+vseq_client_ledger_close( vseq_ledger_t * ledger ) {
+  vseq_ledger_close( ledger );
 }

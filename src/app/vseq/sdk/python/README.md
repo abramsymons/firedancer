@@ -34,6 +34,16 @@ for block in vs.batches():                      # from genesis, forever
 Start from the latest block instead of genesis with
 `vs.batches(after=vs.get_last_finalized())`.
 
+On a node's own machine, an app that trusts that node can read its
+ledger files directly instead of `/blocks` over HTTP, and skip the
+checks below; this saves about 2 ms per block:
+
+```python
+for block in vs.batches(after=vs.get_last_finalized(), poll_interval=0.001,
+                        ledger="/data/ledger-0"):  # the node's --ledger dir
+    ...
+```
+
 ## What is checked
 
 Nothing a node returns is trusted. For every response the SDK:
