@@ -460,16 +460,17 @@ lead( vseq_node_t *         node,
   node->last_led_window = window;
 }
 
-/* leader_tick builds slot i of our window at lead_t0+(i+1)*ns_per_slot.
+/* leader_tick builds slot i of our window at lead_t0+i*ns_per_slot, so
+   the first block leaves at ParentReady with the txs queued meanwhile.
    Votor's skip timeout for that slot fires at
    ParentReady+AG_DELTA_TIMEOUT_NS+(i+1)*ns_per_slot, leaving
-   AG_DELTA_TIMEOUT_NS for the block to reach the other nodes. */
+   AG_DELTA_TIMEOUT_NS+ns_per_slot for the block to reach the other nodes. */
 
 static int
 leader_tick( vseq_node_t * node ) {
   int busy = 0;
   while( node->lead_window!=ULONG_MAX && node->lead_idx<AG_SLOTS_PER_WINDOW &&
-         node->now>=node->lead_t0+(long)(node->lead_idx+1UL)*node->cfg.ns_per_slot ) {
+         node->now>=node->lead_t0+(long)node->lead_idx*node->cfg.ns_per_slot ) {
     ulong slot = node->lead_window+node->lead_idx;
     if( FD_UNLIKELY( slot<=node->quiet_until ) ) node->metrics.blocks_withheld++;
     else                                         build_block( node, slot );
@@ -1025,7 +1026,7 @@ vseq_node_service( vseq_node_t * node,
   long next = ag_votor_next_skip_timeout( node->votor );
   next = fd_long_min( next, repair_tick( node ) );
   next = fd_long_min( next, node->last_final_ts+AG_DELTA_STANDSTILL_NS );
-  if( node->lead_window!=ULONG_MAX ) next = fd_long_min( next, node->lead_t0+(long)(node->lead_idx+1UL)*node->cfg.ns_per_slot );
+  if( node->lead_window!=ULONG_MAX ) next = fd_long_min( next, node->lead_t0+(long)node->lead_idx*node->cfg.ns_per_slot );
   return next;
 }
 
