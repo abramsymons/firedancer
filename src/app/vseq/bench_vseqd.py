@@ -22,6 +22,7 @@ or stalling fsync shows up directly in the tail (see DESIGN.md).
 import argparse
 import multiprocessing as mp
 import os
+import random
 import re
 import shutil
 import signal
@@ -35,10 +36,10 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "sdk", "python"))
 from vseq import Network, Vseq  # noqa: E402
 
-MAGIC = b"VB"  # tx = MAGIC, u64 sequence number, padding
+MAGIC = b"VB"  # tx = MAGIC, u64 run tag + sequence number, padding
 
 
-def sender(args, cluster, start, out):
+def sender(args, cluster, start, tag, out):
     vs = Vseq(Network.from_toml(cluster), lib_path=args.lib)
     pad = bytes(args.tx_size - 10)
     sent, seq, k = [], 0, 0
@@ -51,7 +52,7 @@ def sender(args, cluster, start, out):
         cnt = int(args.rate * (t - start + args.batch_ms / 1000)) - seq  # exact rate over time
         if cnt > 0:
             t_send = time.time()
-            vs.send([MAGIC + struct.pack("<Q", seq + i) + pad for i in range(cnt)])
+            vs.send([MAGIC + struct.pack("<Q", tag + seq + i) + pad for i in range(cnt)])
             sent.append((seq, cnt, t_send))
             seq += cnt
         k += 1
@@ -136,6 +137,7 @@ def run(args, cluster, ledger, logs):
             sys.exit("cluster did not start finalizing" + (f"; see the logs in {logs}" if logs else ""))
         time.sleep(0.2)
     seen = {}
+    tag = random.getrandbits(31) << 32  # txs of earlier runs never match
     done = threading.Event()
 
     def reader():
@@ -144,7 +146,7 @@ def run(args, cluster, ledger, logs):
                 now = time.time()
                 for tx in blk.txs:
                     if tx[:2] == MAGIC:
-                        seen.setdefault(struct.unpack_from("<Q", tx, 2)[0], now)
+                        seen.setdefault(struct.unpack_from("<Q", tx, 2)[0] - tag, now)
                 if done.is_set():
                     return
         except Exception:
@@ -153,7 +155,7 @@ def run(args, cluster, ledger, logs):
 
     threading.Thread(target=reader, daemon=True).start()
     out = mp.Queue()
-    p = mp.Process(target=sender, args=(args, cluster, time.time() + 0.5, out))
+    p = mp.Process(target=sender, args=(args, cluster, time.time() + 0.5, tag, out))
     p.start()
     sent, send_secs = out.get()
     p.join()
