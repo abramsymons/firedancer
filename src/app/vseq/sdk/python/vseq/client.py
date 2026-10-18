@@ -20,14 +20,18 @@ which is built from the same Firedancer code as the nodes.
 
 import ctypes
 import hashlib
+import http.client
+import io
 import json
 import os
 import random
 import struct
+import threading
 import time
 import tomllib
 import urllib.error
-import urllib.request
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 SLOTS_PER_WINDOW = 4
@@ -237,6 +241,10 @@ class Vseq:
         self.pending_max = pending_max  # bytes of blocks held back while waiting for certs
         self._lib = _Lib(lib_path or _find_lib(), network)
         self.bad_nodes = {}  # api URL -> last verification error
+        self._idle = {}  # node URL -> idle kept-alive connections
+        self._idle_lock = threading.Lock()
+        self._senders = ThreadPoolExecutor(max_workers=windows)  # posts to the leaders in parallel
+        self._slot, self._slot_until = 0, 0.0  # cached current_slot()
 
     # Leader schedule ---------------------------------------------------
 
@@ -259,21 +267,47 @@ class Vseq:
             return api + path
         return f"{api}{path}{'&' if '?' in path else '?'}api-key={self.api_key}"
 
+    def _request(self, method, base, path, body=None):
+        """Response body of a request to the node at base, on a kept-alive connection.
+
+        Raises urllib.error.HTTPError for a status of 400 or more.
+        """
+        u = urllib.parse.urlsplit(base)
+        for reuse in (True, False):
+            conn = None
+            if reuse:
+                with self._idle_lock:
+                    idle = self._idle.get(base)
+                    conn = idle.pop() if idle else None
+            reused = conn is not None
+            if not reused:
+                conn = http.client.HTTPConnection(u.hostname, u.port, timeout=self.timeout)
+            try:
+                conn.request(method, self._url(u.path, path), body,
+                             {"Content-Type": "application/octet-stream"} if body is not None else {})
+                r = conn.getresponse()
+                data = r.read()
+            except Exception as e:
+                conn.close()
+                if reused and isinstance(e, ConnectionError):
+                    continue  # the node closed the idle connection: retry once on a new one
+                raise
+            with self._idle_lock:
+                self._idle.setdefault(base, []).append(conn)
+            if r.status >= 400:
+                raise urllib.error.HTTPError(base + path, r.status, r.reason, r.headers, io.BytesIO(data))
+            return data
+
     def _get(self, api, path):
-        with urllib.request.urlopen(self._url(api, path), timeout=self.timeout) as r:
-            return json.loads(r.read())
+        return json.loads(self._request("GET", api, path))
 
     def _get_blocks(self, url, after, limit):
         """(server's finalized slot, [RawBlock])"""
-        with urllib.request.urlopen(self._url(url, f"/blocks?after={after}&limit={limit}"), timeout=self.timeout) as r:
-            return decode_blocks(r.read())
+        return decode_blocks(self._request("GET", url, f"/blocks?after={after}&limit={limit}"))
 
     def _post(self, api, path, body):
-        req = urllib.request.Request(self._url(api, path), data=body, method="POST",
-                                     headers={"Content-Type": "application/octet-stream"})
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                return r.status, json.loads(r.read())
+            return 200, json.loads(self._request("POST", api, path, body))
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}")
 
@@ -296,8 +330,16 @@ class Vseq:
         raise NetworkError("no node answered /status")
 
     def current_slot(self):
-        """A slot estimate for routing: the next slot after some node's finalized slot."""
-        return self.status()["finalized_slot"] + 1
+        """A slot estimate for routing: the next slot after some node's finalized slot.
+
+        Cached for one window: send() reaches the leaders of several
+        windows, so an estimate one window old still covers the next ones.
+        """
+        now = time.time()
+        if now >= self._slot_until:
+            self._slot = self.status()["finalized_slot"] + 1
+            self._slot_until = now + SLOTS_PER_WINDOW * self.network.slot_ms / 1000
+        return self._slot
 
     # Sending -----------------------------------------------------------
 
@@ -315,13 +357,13 @@ class Vseq:
             raise ValueError("no txs")
         anchor = self.get_last_finalized() if blocking else None
         body = frame_txs(txs)
-        accepted = 0
-        for v in self.upcoming_leaders(self.current_slot()):
+
+        def post(v):
             try:
-                code, _ = self._post(v.api, "/txs", body)
-                accepted += code == 200
+                return self._post(v.api, "/txs", body)[0] == 200
             except OSError:
-                continue
+                return False
+        accepted = sum(self._senders.map(post, self.upcoming_leaders(self.current_slot())))
         if not accepted:
             raise NetworkError("no leader accepted the txs")
         if not blocking:
